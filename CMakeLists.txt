@@ -41,6 +41,7 @@ install(TARGETS
 
 install(PROGRAMS
   scripts/cooperative_handling_gui.py
+  scripts/move_arm_to_named_pose.py
   scripts/set_virtual_object_from_tcp.py
   DESTINATION lib/${PROJECT_NAME}
 )

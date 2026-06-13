@@ -274,6 +274,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self._button("Start Hardware", self.start_hardware),
             self._button("Start Object Nodes", self.start_object_nodes),
             self._button("Set From TCP", self.set_from_tcp),
+            self._button("Home L", partial(self.move_home, "l")),
+            self._button("Home R", partial(self.move_home, "r")),
             self._button("Open Object Jog", self.open_object_jog),
             self._button("Stop Managed Processes", self.stop_managed_processes),
         ):
@@ -303,7 +305,10 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.stop_motion_button.clicked.connect(self.stop_motion)
         bottom.addWidget(self.stop_motion_button)
 
-        self.append_log("[gui] Ready. Start object nodes, set from TCP, then arm motion explicitly.")
+        self.append_log(
+            "[gui] Ready. START MOTION only arms virtual-object control; "
+            "Home L/R uses MoveIt separately."
+        )
 
     def _build_robot_box(self):
         box = QtWidgets.QGroupBox("Robot")
@@ -331,6 +336,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.opt_require_wrench = self._check("Require wrench", False)
         self.opt_collision = self._check("Collision avoidance", True)
         self.opt_markers = self._check("Collision markers", False)
+        self.opt_moveit = self._check("Launch MoveIt", False)
         for idx, widget in enumerate(
             [
                 self.opt_build,
@@ -339,6 +345,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 self.opt_require_wrench,
                 self.opt_collision,
                 self.opt_markers,
+                self.opt_moveit,
             ]
         ):
             layout.addWidget(widget, idx // 2, idx % 2)
@@ -426,7 +433,15 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             f"launch_ur_l:={'true' if self.arm_l.isChecked() else 'false'}",
             f"integrated_controller_enable_collision_avoidance:={'true' if self.opt_collision.isChecked() else 'false'}",
             f"integrated_controller_publish_collision_markers:={'true' if self.opt_markers.isChecked() else 'false'}",
+            f"launch_moveit:={'true' if self.opt_moveit.isChecked() else 'false'}",
+            "auto_switch_moveit_controllers:=true",
+            "launch_moveit_rviz:=false",
         ]
+        if self.opt_integrated.isChecked():
+            args.extend([
+                "launch_arm_velocity_safety:=false",
+                "launch_jparse_idk:=false",
+            ])
         env = {
             "ROS_DOMAIN_ID": os.environ.get("ROS_DOMAIN_ID", "62"),
             "ROBOT_PROFILE": profile,
@@ -439,6 +454,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             "INTEGRATED_CARTESIAN_USE_FT": "true" if self.opt_ft.isChecked() else "false",
             "INTEGRATED_CARTESIAN_REQUIRE_WRENCH": (
                 "true" if self.opt_require_wrench.isChecked() else "false"
+            ),
+            "MOVEIT_WITH_INTEGRATED_CARTESIAN": (
+                "true" if self.opt_moveit.isChecked() and self.opt_integrated.isChecked() else "false"
             ),
         }
         command = " ".join([shlex.quote(HARDWARE_SCRIPT)] + [shlex.quote(arg) for arg in args])
@@ -480,6 +498,36 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
         self._jog_dialog = dialog
+
+    def move_home(self, side):
+        prefix = SIDES[side]
+        if not self.opt_moveit.isChecked():
+            self.append_log(
+                f"[gui] Home {prefix}: Launch MoveIt is disabled. "
+                "Enable it before starting hardware, or make sure MoveIt is already running."
+            )
+        self.append_log(
+            f"[gui] Home {prefix}: stopping virtual-object motion gate first; "
+            "START MOTION is not required for Home."
+        )
+        self.ros_worker.publish_object_twist([0.0] * 6)
+        service = f"/{self.robot_name()}/{prefix}/virtual_object_tcp_transform_node/stop"
+        self.ros_worker.call_trigger(service, f"disarm before home {prefix}")
+        QtCore.QTimer.singleShot(500, partial(self._start_home_process, side))
+
+    def _start_home_process(self, side):
+        prefix = SIDES[side]
+        robot = self.robot_name()
+        cmd = (
+            setup_prefix()
+            + "exec ros2 run match_cooperative_handling move_arm_to_named_pose.py --ros-args "
+            + f"-p robot_name:={robot} "
+            + f"-p robot_profile:={self.robot_profile()} "
+            + f"-p arm:={side} "
+            + f"-p group:=UR_arm_{side} "
+            + "-p named_pose:=Home_custom"
+        )
+        self.start_process(f"home_{side}", cmd)
 
     def start_motion(self):
         sides = self.selected_sides()
