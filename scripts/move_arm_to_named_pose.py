@@ -2,6 +2,7 @@
 """Move one MuR620 UR arm to a MoveIt named pose."""
 
 import os
+import copy
 import sys
 import time
 import traceback
@@ -35,30 +36,47 @@ def set_duration_from_seconds(duration, seconds):
         duration.nanosec -= 1_000_000_000
 
 
-def scale_joint_trajectory_speed(robot_trajectory, velocity_scaling):
+def scale_joint_trajectory_speed(
+    robot_trajectory,
+    velocity_scaling,
+    reference_state=None,
+    hold_duration=0.8,
+):
     velocity_scaling = clamp(float(velocity_scaling), 0.01, 1.0)
-    if velocity_scaling >= 0.999:
-        return robot_trajectory
-
-    acceleration_scaling = velocity_scaling * velocity_scaling
-    if hasattr(robot_trajectory, "apply_ruckig_smoothing"):
-        if robot_trajectory.apply_ruckig_smoothing(velocity_scaling, acceleration_scaling):
-            return robot_trajectory
-    if hasattr(robot_trajectory, "apply_totg_time_parameterization"):
-        if robot_trajectory.apply_totg_time_parameterization(velocity_scaling, acceleration_scaling):
-            return robot_trajectory
 
     trajectory_msg = get_robot_trajectory_msg(robot_trajectory)
-    time_scale = 1.0 / velocity_scaling
-    for point in trajectory_msg.joint_trajectory.points:
-        set_duration_from_seconds(
-            point.time_from_start,
-            duration_to_seconds(point.time_from_start) * time_scale,
-        )
-        point.velocities = [value * velocity_scaling for value in point.velocities]
-        point.accelerations = [
-            value * velocity_scaling * velocity_scaling for value in point.accelerations
-        ]
+    points = trajectory_msg.joint_trajectory.points
+    if points:
+        if velocity_scaling < 0.999:
+            time_scale = 1.0 / velocity_scaling
+            for point in points:
+                set_duration_from_seconds(
+                    point.time_from_start,
+                    duration_to_seconds(point.time_from_start) * time_scale,
+                )
+                point.velocities = [value * velocity_scaling for value in point.velocities]
+                point.accelerations = [
+                    value * velocity_scaling * velocity_scaling
+                    for value in point.accelerations
+                ]
+
+        points[0].velocities = [0.0] * len(points[0].positions)
+        points[0].accelerations = [0.0] * len(points[0].positions)
+        points[-1].velocities = [0.0] * len(points[-1].positions)
+        points[-1].accelerations = [0.0] * len(points[-1].positions)
+
+        if hold_duration > 0.0:
+            hold_point = copy.deepcopy(points[-1])
+            hold_point.velocities = [0.0] * len(hold_point.positions)
+            hold_point.accelerations = [0.0] * len(hold_point.positions)
+            set_duration_from_seconds(
+                hold_point.time_from_start,
+                duration_to_seconds(points[-1].time_from_start) + hold_duration,
+            )
+            points.append(hold_point)
+
+    if hasattr(robot_trajectory, "set_robot_trajectory_msg") and reference_state is not None:
+        robot_trajectory.set_robot_trajectory_msg(reference_state, trajectory_msg)
     return robot_trajectory
 
 
@@ -205,6 +223,7 @@ class MoveArmToNamedPose(Node):
         self.declare_parameter("group", "")
         self.declare_parameter("named_pose", "Home_custom")
         self.declare_parameter("velocity_scaling", 0.2)
+        self.declare_parameter("hold_duration", 0.8)
         self.declare_parameter("node_name", "cooperative_home_moveit_py")
         self.declare_parameter("wait_after_init", 1.0)
 
@@ -215,6 +234,7 @@ class MoveArmToNamedPose(Node):
         self.group = str(self.get_parameter("group").value) or SIDES.get(self.arm, "UR_arm_r")
         self.named_pose = str(self.get_parameter("named_pose").value)
         self.velocity_scaling = clamp(float(self.get_parameter("velocity_scaling").value), 0.01, 1.0)
+        self.hold_duration = max(0.0, float(self.get_parameter("hold_duration").value))
         self.node_name = str(self.get_parameter("node_name").value)
         self.wait_after_init = float(self.get_parameter("wait_after_init").value)
 
@@ -262,6 +282,7 @@ class MoveArmToNamedPose(Node):
             )
             return 3
 
+        start_state = planning_component.get_start_state()
         plan_result = planning_component.plan()
         error_code = getattr(plan_result.error_code, "val", 999)
         if error_code != 1:
@@ -271,16 +292,26 @@ class MoveArmToNamedPose(Node):
             )
             return 4
 
-        scale_joint_trajectory_speed(plan_result.trajectory, self.velocity_scaling)
+        before_msg = get_robot_trajectory_msg(plan_result.trajectory)
+        before_duration = (
+            duration_to_seconds(before_msg.joint_trajectory.points[-1].time_from_start)
+            if before_msg.joint_trajectory.points
+            else 0.0
+        )
+        scale_joint_trajectory_speed(
+            plan_result.trajectory,
+            self.velocity_scaling,
+            reference_state=start_state,
+            hold_duration=self.hold_duration,
+        )
 
-        duration = 0.0
         trajectory_msg = get_robot_trajectory_msg(plan_result.trajectory)
         points = trajectory_msg.joint_trajectory.points
-        if points:
-            duration = duration_to_seconds(points[-1].time_from_start)
+        duration = duration_to_seconds(points[-1].time_from_start) if points else 0.0
         self.get_logger().info(
             f"Planning succeeded; executing trajectory with {len(points)} points, "
-            f"duration={duration:.3f}s"
+            f"duration={duration:.3f}s (unscaled={before_duration:.3f}s, "
+            f"velocity_scaling={self.velocity_scaling:.2f}, hold={self.hold_duration:.2f}s)"
         )
         execute_result = moveit.execute(plan_result.trajectory, controllers=[])
         self.get_logger().info(
