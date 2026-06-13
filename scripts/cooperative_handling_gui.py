@@ -323,6 +323,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.arm_r = QtWidgets.QCheckBox("UR10_r")
         self.arm_r.setChecked(True)
         self.arm_l = QtWidgets.QCheckBox("UR10_l")
+        self.arm_l.setChecked(True)
         layout.addRow(self.arm_r)
         layout.addRow(self.arm_l)
         return box
@@ -336,7 +337,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.opt_require_wrench = self._check("Require wrench", False)
         self.opt_collision = self._check("Collision avoidance", True)
         self.opt_markers = self._check("Collision markers", False)
-        self.opt_moveit = self._check("Launch MoveIt", False)
+        self.opt_moveit = self._check("Launch MoveIt", True)
+        self.moveit_speed_label = QtWidgets.QLabel("MoveIt speed: 20%")
+        self.moveit_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.moveit_speed_slider.setRange(1, 100)
+        self.moveit_speed_slider.setValue(20)
+        self.moveit_speed_slider.valueChanged.connect(self.update_moveit_speed_label)
         for idx, widget in enumerate(
             [
                 self.opt_build,
@@ -349,6 +355,17 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             ]
         ):
             layout.addWidget(widget, idx // 2, idx % 2)
+        row = (len([
+            self.opt_build,
+            self.opt_integrated,
+            self.opt_ft,
+            self.opt_require_wrench,
+            self.opt_collision,
+            self.opt_markers,
+            self.opt_moveit,
+        ]) + 1) // 2
+        layout.addWidget(self.moveit_speed_label, row, 0)
+        layout.addWidget(self.moveit_speed_slider, row, 1)
         return box
 
     def _build_status_box(self):
@@ -369,6 +386,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         button = QtWidgets.QPushButton(text)
         button.clicked.connect(callback)
         return button
+
+    def update_moveit_speed_label(self, value):
+        self.moveit_speed_label.setText(f"MoveIt speed: {value}%")
+
+    def moveit_velocity_scaling(self):
+        return max(1, min(100, self.moveit_speed_slider.value())) / 100.0
 
     def robot_profile(self):
         return self.robot_combo.currentText()
@@ -525,7 +548,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             + f"-p robot_profile:={self.robot_profile()} "
             + f"-p arm:={side} "
             + f"-p group:=UR_arm_{side} "
-            + "-p named_pose:=Home_custom"
+            + "-p named_pose:=Home_custom "
+            + f"-p velocity_scaling:={self.moveit_velocity_scaling():.3f}"
         )
         self.start_process(f"home_{side}", cmd)
 

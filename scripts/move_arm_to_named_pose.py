@@ -18,6 +18,61 @@ from rclpy.node import Node
 SIDES = {"r": "UR_arm_r", "l": "UR_arm_l"}
 
 
+def clamp(value, lower, upper):
+    return max(lower, min(upper, value))
+
+
+def duration_to_seconds(duration):
+    return float(duration.sec) + float(duration.nanosec) * 1e-9
+
+
+def set_duration_from_seconds(duration, seconds):
+    seconds = max(0.0, seconds)
+    duration.sec = int(seconds)
+    duration.nanosec = int(round((seconds - duration.sec) * 1e9))
+    if duration.nanosec >= 1_000_000_000:
+        duration.sec += 1
+        duration.nanosec -= 1_000_000_000
+
+
+def scale_joint_trajectory_speed(robot_trajectory, velocity_scaling):
+    velocity_scaling = clamp(float(velocity_scaling), 0.01, 1.0)
+    if velocity_scaling >= 0.999:
+        return robot_trajectory
+
+    acceleration_scaling = velocity_scaling * velocity_scaling
+    if hasattr(robot_trajectory, "apply_ruckig_smoothing"):
+        if robot_trajectory.apply_ruckig_smoothing(velocity_scaling, acceleration_scaling):
+            return robot_trajectory
+    if hasattr(robot_trajectory, "apply_totg_time_parameterization"):
+        if robot_trajectory.apply_totg_time_parameterization(velocity_scaling, acceleration_scaling):
+            return robot_trajectory
+
+    trajectory_msg = get_robot_trajectory_msg(robot_trajectory)
+    time_scale = 1.0 / velocity_scaling
+    for point in trajectory_msg.joint_trajectory.points:
+        set_duration_from_seconds(
+            point.time_from_start,
+            duration_to_seconds(point.time_from_start) * time_scale,
+        )
+        point.velocities = [value * velocity_scaling for value in point.velocities]
+        point.accelerations = [
+            value * velocity_scaling * velocity_scaling for value in point.accelerations
+        ]
+    return robot_trajectory
+
+
+def get_robot_trajectory_msg(robot_trajectory):
+    if hasattr(robot_trajectory, "joint_trajectory"):
+        return robot_trajectory
+    if hasattr(robot_trajectory, "get_robot_trajectory_msg"):
+        return robot_trajectory.get_robot_trajectory_msg()
+    raise AttributeError(
+        f"Unsupported trajectory type '{type(robot_trajectory).__name__}': "
+        "missing joint_trajectory and get_robot_trajectory_msg()"
+    )
+
+
 def arm_controller_config(controller_namespace):
     controller_prefix = f"/{controller_namespace}" if controller_namespace else ""
     left_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_l"
@@ -149,6 +204,7 @@ class MoveArmToNamedPose(Node):
         self.declare_parameter("arm", "r")
         self.declare_parameter("group", "")
         self.declare_parameter("named_pose", "Home_custom")
+        self.declare_parameter("velocity_scaling", 0.2)
         self.declare_parameter("node_name", "cooperative_home_moveit_py")
         self.declare_parameter("wait_after_init", 1.0)
 
@@ -158,6 +214,7 @@ class MoveArmToNamedPose(Node):
         self.arm = str(self.get_parameter("arm").value)
         self.group = str(self.get_parameter("group").value) or SIDES.get(self.arm, "UR_arm_r")
         self.named_pose = str(self.get_parameter("named_pose").value)
+        self.velocity_scaling = clamp(float(self.get_parameter("velocity_scaling").value), 0.01, 1.0)
         self.node_name = str(self.get_parameter("node_name").value)
         self.wait_after_init = float(self.get_parameter("wait_after_init").value)
 
@@ -192,7 +249,7 @@ class MoveArmToNamedPose(Node):
 
         self.get_logger().info(
             f"Planning {self.group} ({self.arm}) to named pose '{self.named_pose}' "
-            f"with profile '{self.robot_profile}'"
+            f"with profile '{self.robot_profile}', velocity_scaling={self.velocity_scaling:.2f}"
         )
         moveit = MoveItPy(node_name=self.node_name, config_dict=self.make_moveit_config())
         if self.wait_after_init > 0.0:
@@ -214,7 +271,17 @@ class MoveArmToNamedPose(Node):
             )
             return 4
 
-        self.get_logger().info("Planning succeeded; executing trajectory...")
+        scale_joint_trajectory_speed(plan_result.trajectory, self.velocity_scaling)
+
+        duration = 0.0
+        trajectory_msg = get_robot_trajectory_msg(plan_result.trajectory)
+        points = trajectory_msg.joint_trajectory.points
+        if points:
+            duration = duration_to_seconds(points[-1].time_from_start)
+        self.get_logger().info(
+            f"Planning succeeded; executing trajectory with {len(points)} points, "
+            f"duration={duration:.3f}s"
+        )
         execute_result = moveit.execute(plan_result.trajectory, controllers=[])
         self.get_logger().info(
             f"Execution request finished for {self.group} -> {self.named_pose}; "
