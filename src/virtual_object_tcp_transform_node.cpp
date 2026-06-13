@@ -9,6 +9,8 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/LinearMath/Vector3.h>
@@ -21,6 +23,8 @@ namespace match_cooperative_handling
 {
 namespace
 {
+
+constexpr double kPi = 3.14159265358979323846;
 
 std::string arm_prefix(const std::string & arm)
 {
@@ -144,9 +148,19 @@ public:
     orientation_gain_ = std::max(0.0, declare_parameter<double>("orientation_gain", 0.8));
     max_linear_velocity_ = std::max(0.0, declare_parameter<double>("max_linear_velocity", 0.12));
     max_angular_velocity_ = std::max(0.0, declare_parameter<double>("max_angular_velocity", 0.4));
+    start_max_position_error_ =
+      std::max(0.0, declare_parameter<double>("start_max_position_error", 0.03));
+    start_max_orientation_error_ =
+      std::max(0.0, declare_parameter<double>("start_max_orientation_error_deg", 5.0)) *
+      kPi / 180.0;
+    require_controller_subscriber_ =
+      declare_parameter<bool>("require_controller_subscriber", true);
+    status_publish_rate_hz_ =
+      std::max(0.1, declare_parameter<double>("status_publish_rate_hz", 10.0));
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
 
     command_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(controller_twist_topic_, 10);
+    status_pub_ = create_publisher<std_msgs::msg::String>("~/status", 10);
     target_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/target_tcp_pose", 10);
     relative_pose_pub_ =
       create_publisher<geometry_msgs::msg::PoseStamped>("~/relative_object_to_tcp_pose_debug", 10);
@@ -201,6 +215,42 @@ public:
           relative_object_to_tcp_.getOrigin().z());
       });
 
+    start_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/start",
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        std::string reason;
+        double position_error = 0.0;
+        double orientation_error = 0.0;
+        if (!start_preflight(reason, position_error, orientation_error)) {
+          armed_ = false;
+          response->success = false;
+          response->message = reason;
+          publish_zero(now());
+          publish_status(now(), "blocked: " + reason, true);
+          return;
+        }
+        armed_ = true;
+        response->success = true;
+        response->message =
+          "armed: position_error=" + std::to_string(position_error) +
+          " m, orientation_error=" + std::to_string(orientation_error * 180.0 / kPi) + " deg";
+        publish_status(now(), "armed", true);
+      });
+
+    stop_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/stop",
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        armed_ = false;
+        publish_zero(now());
+        response->success = true;
+        response->message = "disarmed";
+        publish_status(now(), "disarmed", true);
+      });
+
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(1.0 / rate_hz_));
     timer_ = create_wall_timer(period, [this]() { update(); });
@@ -214,8 +264,11 @@ private:
   void update()
   {
     const rclcpp::Time stamp = now();
-    if (!inputs_ready(stamp)) {
+    std::string reason;
+    if (!inputs_ready(stamp, reason)) {
+      armed_ = false;
       publish_zero(stamp);
+      publish_status(stamp, "blocked: " + reason, false);
       return;
     }
 
@@ -232,6 +285,7 @@ private:
         base_frame_.c_str(), world_frame_.c_str(), base_frame_.c_str(), tcp_frame_.c_str(),
         exc.what());
       publish_zero(stamp);
+      publish_status(stamp, "blocked: waiting for TF", false);
       return;
     }
 
@@ -257,27 +311,93 @@ private:
     linear_cmd = clamp_norm(linear_cmd, max_linear_velocity_);
     angular_cmd = clamp_norm(angular_cmd, max_angular_velocity_);
 
-    geometry_msgs::msg::TwistStamped command;
-    command.header.stamp = stamp;
-    command.header.frame_id = command_frame_;
-    vector_to_msg(linear_cmd, command.twist.linear);
-    vector_to_msg(angular_cmd, command.twist.angular);
-    command_pub_->publish(command);
+    if (armed_) {
+      geometry_msgs::msg::TwistStamped command;
+      command.header.stamp = stamp;
+      command.header.frame_id = command_frame_;
+      vector_to_msg(linear_cmd, command.twist.linear);
+      vector_to_msg(angular_cmd, command.twist.angular);
+      command_pub_->publish(command);
+      publish_status(stamp, "armed", false);
+    } else {
+      publish_zero(stamp);
+      publish_status(stamp, "ready", false);
+    }
 
     publish_debug(stamp, target_base, position_error, rotation_error);
   }
 
-  bool inputs_ready(const rclcpp::Time & stamp) const
+  bool inputs_ready(const rclcpp::Time & stamp, std::string & reason) const
   {
-    if (!have_object_pose_ || !have_object_twist_ || !have_relative_pose_) {
+    if (!have_object_pose_) {
+      reason = "missing object pose";
+      return false;
+    }
+    if (!have_object_twist_) {
+      reason = "missing object twist";
+      return false;
+    }
+    if (!have_relative_pose_) {
+      reason = "missing relative object->tcp pose";
       return false;
     }
     if ((stamp - object_pose_stamp_).seconds() > input_timeout_) {
+      reason = "stale object pose";
       return false;
     }
     if ((stamp - object_twist_stamp_).seconds() > input_timeout_) {
+      reason = "stale object twist";
       return false;
     }
+    reason.clear();
+    return true;
+  }
+
+  bool start_preflight(std::string & reason, double & position_error, double & orientation_error)
+  {
+    const rclcpp::Time stamp = now();
+    if (!inputs_ready(stamp, reason)) {
+      return false;
+    }
+    if (require_controller_subscriber_ && command_pub_->get_subscription_count() == 0) {
+      reason = "controller command subscriber missing";
+      return false;
+    }
+
+    tf2::Transform base_from_world;
+    tf2::Transform current_tcp;
+    try {
+      base_from_world = transform_from_msg(tf_buffer_.lookupTransform(
+          base_frame_, world_frame_, tf2::TimePointZero));
+      current_tcp = transform_from_msg(tf_buffer_.lookupTransform(
+          base_frame_, tcp_frame_, tf2::TimePointZero));
+    } catch (const tf2::TransformException & exc) {
+      reason = std::string("waiting for TF: ") + exc.what();
+      return false;
+    }
+
+    const tf2::Transform target_world = object_pose_ * relative_object_to_tcp_;
+    const tf2::Transform target_base = base_from_world * target_world;
+    const tf2::Vector3 position_delta = target_base.getOrigin() - current_tcp.getOrigin();
+    const tf2::Quaternion orientation_delta =
+      target_base.getRotation() * current_tcp.getRotation().inverse();
+    position_error = position_delta.length();
+    orientation_error = rotation_vector_from_quaternion(orientation_delta).length();
+
+    if (position_error > start_max_position_error_) {
+      reason =
+        "start position error too large: " + std::to_string(position_error) +
+        " m > " + std::to_string(start_max_position_error_) + " m";
+      return false;
+    }
+    if (orientation_error > start_max_orientation_error_) {
+      reason =
+        "start orientation error too large: " +
+        std::to_string(orientation_error * 180.0 / kPi) +
+        " deg > " + std::to_string(start_max_orientation_error_ * 180.0 / kPi) + " deg";
+      return false;
+    }
+    reason.clear();
     return true;
   }
 
@@ -287,6 +407,24 @@ private:
     command.header.stamp = stamp;
     command.header.frame_id = command_frame_;
     command_pub_->publish(command);
+  }
+
+  void publish_status(
+    const rclcpp::Time & stamp,
+    const std::string & status,
+    bool force)
+  {
+    if (!force) {
+      const double min_period = 1.0 / status_publish_rate_hz_;
+      if ((stamp - last_status_publish_time_).seconds() < min_period && status == last_status_) {
+        return;
+      }
+    }
+    std_msgs::msg::String msg;
+    msg.data = status;
+    status_pub_->publish(msg);
+    last_status_ = status;
+    last_status_publish_time_ = stamp;
   }
 
   void publish_debug(
@@ -346,7 +484,12 @@ private:
   double orientation_gain_{0.8};
   double max_linear_velocity_{0.12};
   double max_angular_velocity_{0.4};
+  double start_max_position_error_{0.03};
+  double start_max_orientation_error_{5.0 * kPi / 180.0};
+  double status_publish_rate_hz_{10.0};
+  bool require_controller_subscriber_{true};
   bool publish_tf_{true};
+  bool armed_{false};
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -365,11 +508,16 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr object_pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr object_twist_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr relative_pose_sub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr command_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr relative_pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pose_error_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Time last_status_publish_time_{0, 0, RCL_ROS_TIME};
+  std::string last_status_;
 };
 
 }  // namespace match_cooperative_handling
