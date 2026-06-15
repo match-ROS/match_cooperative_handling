@@ -281,6 +281,14 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         ):
             actions.addWidget(button)
 
+        tools = QtWidgets.QHBoxLayout()
+        root.addLayout(tools)
+        for button in (
+            self._button("Open RViz", self.open_rviz),
+        ):
+            tools.addWidget(button)
+        tools.addStretch(1)
+
         self.terminal = QtWidgets.QPlainTextEdit()
         self.terminal.setReadOnly(True)
         self.terminal.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
@@ -521,6 +529,26 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
         self._jog_dialog = dialog
+
+    def open_rviz(self):
+        robot = self.robot_name()
+        config_path = (
+            "$(ros2 pkg prefix mur_launch_hardware)"
+            "/share/mur_launch_hardware/config/rviz/mur620d_moveit.rviz"
+        )
+        cmd = (
+            setup_prefix()
+            + "exec rviz2 "
+            + f"-d {config_path} "
+            + "--ros-args "
+            + f"-r /tf:=/tf "
+            + f"-r /tf_static:=/tf_static "
+            + f"-p use_sim_time:=false"
+        )
+        self.append_log(
+            f"[gui] Opening RViz for {robot}. MoveIt must be running for MotionPlanning."
+        )
+        self.start_process("rviz_moveit", cmd)
 
     def move_home(self, side):
         prefix = SIDES[side]

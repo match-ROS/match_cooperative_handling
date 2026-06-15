@@ -182,7 +182,9 @@ def robot_description_source(robot_name, robot_profile, ur_type):
     arms = profile.get("arms", {})
     left = arms.get("l", {})
     right = arms.get("r", {})
-    return xacro_file, {
+    home_custom_l_shoulder_pan = str(left.get("home_custom_shoulder_pan", "0.0"))
+    home_custom_r_shoulder_pan = str(right.get("home_custom_shoulder_pan", "0.0"))
+    robot_xacro_mappings = {
         "tf_prefix": robot_name,
         "tf_prefix_mir": robot_name,
         "robot_namespace": robot_name,
@@ -211,6 +213,11 @@ def robot_description_source(robot_name, robot_profile, ur_type):
             mur_launch_hardware_path, right.get("kinematics_params_file", "")
         ),
     }
+    srdf_xacro_mappings = {
+        "home_custom_l_shoulder_pan": home_custom_l_shoulder_pan,
+        "home_custom_r_shoulder_pan": home_custom_r_shoulder_pan,
+    }
+    return xacro_file, robot_xacro_mappings, srdf_xacro_mappings
 
 
 class MoveArmToNamedPose(Node):
@@ -239,7 +246,7 @@ class MoveArmToNamedPose(Node):
         self.wait_after_init = float(self.get_parameter("wait_after_init").value)
 
     def make_moveit_config(self):
-        robot_xacro_file, robot_xacro_mappings = robot_description_source(
+        robot_xacro_file, robot_xacro_mappings, srdf_xacro_mappings = robot_description_source(
             self.robot_name, self.robot_profile, self.ur_type
         )
         virtual_joint_parent_frame = f"{self.robot_name}/base_footprint"
@@ -252,6 +259,12 @@ class MoveArmToNamedPose(Node):
                     "prefix": "UR10",
                     "model_name": "mur620",
                     "virtual_joint_parent_frame": virtual_joint_parent_frame,
+                    "home_custom_l_shoulder_pan": srdf_xacro_mappings[
+                        "home_custom_l_shoulder_pan"
+                    ],
+                    "home_custom_r_shoulder_pan": srdf_xacro_mappings[
+                        "home_custom_r_shoulder_pan"
+                    ],
                 },
             )
             .moveit_cpp(file_path="config/moveit_cpp.yaml")
