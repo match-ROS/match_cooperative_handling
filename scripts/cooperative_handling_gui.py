@@ -19,6 +19,7 @@ from controller_manager_msgs.srv import (
     SwitchController,
 )
 from geometry_msgs.msg import TwistStamped
+from lifecycle_msgs.msg import State, TransitionEvent
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
@@ -27,9 +28,18 @@ WS = os.environ.get("WS", "/home/rosmatch/colcon_ws")
 HARDWARE_SCRIPT = os.path.join(
     WS, "src", "match_mobile_robotics_jazzy", "start_mur620_hardware_logged.sh"
 )
+HARDWARE_LATEST_LOG = os.path.join(
+    WS, "src", "match_mobile_robotics_jazzy", "logs", "hardware", "latest.log"
+)
 PACKAGE = "match_cooperative_handling"
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
 FREEDRIVE_CONTROLLER = "freedrive_mode_controller"
+FREEDRIVE_ENABLE_WAIT_SEC = 3.0
+FREEDRIVE_ACTIVE_TRANSITION_WAIT_SEC = 4.0
+FREEDRIVE_KEEPALIVE_HZ = 10.0
+UR_REVERSE_READY_TEXT = "Robot connected to reverse interface. Ready to receive control commands."
+UR_REVERSE_WAIT_SEC = 12.0
+UR_READY_RETRY_LIMIT = 1
 MOTION_CONTROLLERS = [
     "integrated_cartesian_admittance_controller",
     "forward_velocity_controller",
@@ -69,6 +79,8 @@ class RosWorker(QtCore.QThread):
         self._status_subs = []
         self._previous_freedrive_controllers = {}
         self._freedrive_enable_pubs = {}
+        self._freedrive_keepalive = {}
+        self._freedrive_keepalive_last = {}
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -87,7 +99,9 @@ class RosWorker(QtCore.QThread):
         self.log.emit("[ros] GUI ROS helper started")
         while rclpy.ok() and not self._stop.is_set():
             rclpy.spin_once(self._node, timeout_sec=0.05)
+            self._publish_freedrive_keepalives()
         self.publish_object_twist([0.0] * 6)
+        self._stop_all_freedrive_keepalives()
         self._node.destroy_node()
         rclpy.shutdown()
 
@@ -224,27 +238,120 @@ class RosWorker(QtCore.QThread):
                 return None, error
         return states, ""
 
+    def _wait_for_controller_state(self, controller_manager, controller_name, target_state, timeout_sec):
+        deadline = time.monotonic() + timeout_sec
+        last_state = "missing"
+        last_error = ""
+        while time.monotonic() < deadline:
+            states, error = self._list_controller_states(controller_manager)
+            if states is None:
+                last_error = error
+            else:
+                last_state = states.get(controller_name, "missing")
+                if last_state == target_state:
+                    return True, f"{controller_name} is {target_state}"
+            self.msleep(50)
+        detail = last_error or f"last state was '{last_state}'"
+        return False, f"timeout waiting for {controller_name} to become {target_state}: {detail}"
+
     def _freedrive_enable_topic(self, robot_name, side):
         return f"/{robot_name}/{SIDES[side]}/{FREEDRIVE_CONTROLLER}/enable_freedrive_mode"
 
-    def _publish_freedrive_enable(self, robot_name, side, enabled):
+    def _freedrive_transition_topic(self, robot_name, side):
+        return f"/{robot_name}/{SIDES[side]}/{FREEDRIVE_CONTROLLER}/transition_event"
+
+    def _get_freedrive_enable_publisher(self, robot_name, side):
         topic = self._freedrive_enable_topic(robot_name, side)
         with self._lock:
             publisher = self._freedrive_enable_pubs.get(topic)
             if publisher is None:
                 publisher = self._node.create_publisher(Bool, topic, 10)
                 self._freedrive_enable_pubs[topic] = publisher
+        return topic, publisher
 
-        deadline = time.monotonic() + 1.0
+    def _create_freedrive_active_transition_waiter(self, robot_name, side):
+        topic = self._freedrive_transition_topic(robot_name, side)
+        event = threading.Event()
+        details = {"message": "no transition_event received"}
+
+        def callback(msg):
+            goal_label = msg.goal_state.label
+            goal_id = msg.goal_state.id
+            transition_label = msg.transition.label
+            details["message"] = (
+                f"transition_event {transition_label}: "
+                f"{msg.start_state.label}->{goal_label} ({goal_id})"
+            )
+            if goal_id == State.PRIMARY_STATE_ACTIVE or goal_label == "active":
+                event.set()
+
+        with self._lock:
+            subscription = self._node.create_subscription(
+                TransitionEvent,
+                topic,
+                callback,
+                10,
+            )
+
+        def destroy():
+            with self._lock:
+                self._node.destroy_subscription(subscription)
+
+        return event, details, destroy
+
+    def _publish_freedrive_enable(self, robot_name, side, enabled):
+        topic, publisher = self._get_freedrive_enable_publisher(robot_name, side)
+
+        deadline = time.monotonic() + FREEDRIVE_ENABLE_WAIT_SEC
         while publisher.get_subscription_count() == 0 and time.monotonic() < deadline:
             self.msleep(20)
 
+        subscription_count = publisher.get_subscription_count()
         msg = Bool()
         msg.data = bool(enabled)
-        for _ in range(10):
+        publisher.publish(msg)
+
+        if subscription_count == 0:
+            return (
+                False,
+                f"Published {msg.data} on {topic}, but no subscriber was discovered "
+                f"within {FREEDRIVE_ENABLE_WAIT_SEC:.1f}s",
+            )
+        return (
+            True,
+            f"Published {msg.data} once on {topic} (subscribers={subscription_count})",
+        )
+
+    def _set_freedrive_keepalive(self, robot_name, side, enabled):
+        key = (robot_name, side)
+        with self._lock:
+            self._freedrive_keepalive[key] = bool(enabled)
+            self._freedrive_keepalive_last[key] = 0.0
+
+    def _publish_freedrive_keepalives(self):
+        period = 1.0 / FREEDRIVE_KEEPALIVE_HZ
+        now = time.monotonic()
+        with self._lock:
+            items = list(self._freedrive_keepalive.items())
+
+        for (robot_name, side), enabled in items:
+            if not enabled:
+                continue
+            last = self._freedrive_keepalive_last.get((robot_name, side), 0.0)
+            if now - last < period:
+                continue
+            _topic, publisher = self._get_freedrive_enable_publisher(robot_name, side)
+            msg = Bool()
+            msg.data = True
             publisher.publish(msg)
-            self.msleep(20)
-        self.log.emit(f"[ros] Published {msg.data} on {topic}")
+            self._freedrive_keepalive_last[(robot_name, side)] = now
+
+    def _stop_all_freedrive_keepalives(self):
+        with self._lock:
+            keys = list(self._freedrive_keepalive.keys())
+        for robot_name, side in keys:
+            self._set_freedrive_keepalive(robot_name, side, False)
+            self._publish_freedrive_enable(robot_name, side, False)
 
     def _switch_controllers(self, controller_manager, activate, deactivate, label):
         with self._lock:
@@ -304,28 +411,69 @@ class RosWorker(QtCore.QThread):
                 self._previous_freedrive_controllers[key] = active_motion
             elif key not in self._previous_freedrive_controllers:
                 self._previous_freedrive_controllers[key] = [fallback_controller]
-            ok, message = self._switch_controllers(
-                controller_manager,
-                activate=[FREEDRIVE_CONTROLLER],
-                deactivate=active_motion,
-                label=f"Freedrive ON {SIDES[side]}",
+            transition_event, transition_details, destroy_transition_sub = (
+                self._create_freedrive_active_transition_waiter(robot_name, side)
             )
-            if ok:
-                self._publish_freedrive_enable(robot_name, side, True)
-                message += "; enable_freedrive_mode=true sent"
+            try:
+                ok, message = self._switch_controllers(
+                    controller_manager,
+                    activate=[FREEDRIVE_CONTROLLER],
+                    deactivate=active_motion,
+                    label=f"Freedrive ON {SIDES[side]}",
+                )
+                if ok:
+                    saw_transition = transition_event.wait(
+                        timeout=FREEDRIVE_ACTIVE_TRANSITION_WAIT_SEC
+                    )
+                    if saw_transition:
+                        message += f"; {transition_details['message']}"
+                    else:
+                        state_ok, active_message = self._wait_for_controller_state(
+                            controller_manager,
+                            FREEDRIVE_CONTROLLER,
+                            "active",
+                            timeout_sec=0.5,
+                        )
+                        if state_ok:
+                            message += (
+                                "; no active transition_event observed, "
+                                f"but {active_message}"
+                            )
+                        else:
+                            ok = False
+                            message += (
+                                "; timeout waiting for active transition_event "
+                                f"on {self._freedrive_transition_topic(robot_name, side)}; "
+                                f"{transition_details['message']}; {active_message}"
+                            )
+                if ok:
+                    publish_ok, publish_message = self._publish_freedrive_enable(
+                        robot_name, side, True
+                    )
+                    message += f"; {publish_message}"
+                    ok = publish_ok
+                if ok:
+                    self._set_freedrive_keepalive(robot_name, side, True)
+                    message += f"; keepalive started at {FREEDRIVE_KEEPALIVE_HZ:.1f} Hz"
+            finally:
+                destroy_transition_sub()
             self.log.emit(f"[ros] {message}")
             self.freedrive_status.emit(side, ok, message)
             return
 
         restore = self._previous_freedrive_controllers.get(key) or [fallback_controller]
         restore = [name for name in restore if name and name != FREEDRIVE_CONTROLLER]
-        self._publish_freedrive_enable(robot_name, side, False)
+        self._set_freedrive_keepalive(robot_name, side, False)
+        publish_ok, publish_message = self._publish_freedrive_enable(robot_name, side, False)
+        self.log.emit(f"[ros] Freedrive OFF {SIDES[side]}: {publish_message}")
         ok, message = self._switch_controllers(
             controller_manager,
             activate=restore,
             deactivate=[FREEDRIVE_CONTROLLER],
             label=f"Freedrive OFF {SIDES[side]}",
         )
+        if publish_ok:
+            message += "; enable_freedrive_mode=false sent"
         self.log.emit(f"[ros] {message}")
         self.freedrive_status.emit(side, False if ok else True, message)
 
@@ -573,6 +721,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.resize(1180, 780)
         self.processes = {}
         self.arm_status = {"r": "unknown", "l": "unknown"}
+        self.ur_reverse_ready = {"r": False, "l": False}
         self.freedrive_active = {"r": False, "l": False}
 
         self.ros_worker = RosWorker("mur620")
@@ -761,12 +910,31 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def on_ros_name_changed(self):
         self.ros_worker.set_robot_name(self.robot_name())
         self.arm_status = {"r": "unknown", "l": "unknown"}
-        self.status_r.setText("unknown")
-        self.status_l.setText("unknown")
+        self.ur_reverse_ready = {"r": False, "l": False}
+        self.refresh_status_labels()
 
     def update_arm_status(self, side, status):
         self.arm_status[side] = status
-        (self.status_r if side == "r" else self.status_l).setText(status)
+        self.refresh_status_label(side)
+
+    def set_ur_reverse_ready(self, side, ready, reason):
+        if self.ur_reverse_ready.get(side) == ready:
+            return
+        self.ur_reverse_ready[side] = ready
+        state = "ready" if ready else "not ready"
+        self.append_log(f"[gui] {SIDES[side]} UR reverse interface {state}: {reason}")
+        self.refresh_status_label(side)
+
+    def refresh_status_label(self, side):
+        gate_status = self.arm_status.get(side, "unknown")
+        reverse_status = "UR reverse OK" if self.ur_reverse_ready.get(side, False) else "UR reverse missing"
+        (self.status_r if side == "r" else self.status_l).setText(
+            f"{gate_status} | {reverse_status}"
+        )
+
+    def refresh_status_labels(self):
+        for side in SIDES:
+            self.refresh_status_label(side)
 
     def update_freedrive_status(self, side, active, message):
         self.freedrive_active[side] = active
@@ -828,9 +996,48 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         data = bytes(process.readAllStandardOutput()).decode(errors="replace")
         for line in data.splitlines():
             self.append_log(f"[{tag}] {line}")
+            if tag == "hardware":
+                self._observe_hardware_line(line)
+
+    def _observe_hardware_line(self, line):
+        if UR_REVERSE_READY_TEXT in line:
+            for side, prefix in SIDES.items():
+                if prefix in line:
+                    self.set_ur_reverse_ready(side, True, "reverse interface connected")
+            return
+
+        if "UR SetMode goal was rejected" in line:
+            for side, prefix in SIDES.items():
+                if prefix in line:
+                    self.set_ur_reverse_ready(side, False, "SetMode goal rejected")
+
+    def _scan_latest_hardware_log_for_reverse_ready(self, sides):
+        try:
+            with open(HARDWARE_LATEST_LOG, "rb") as log_file:
+                log_file.seek(0, os.SEEK_END)
+                size = log_file.tell()
+                log_file.seek(max(0, size - 512_000), os.SEEK_SET)
+                text = log_file.read().decode(errors="replace")
+        except OSError:
+            return
+
+        for line in text.splitlines():
+            if UR_REVERSE_READY_TEXT not in line:
+                continue
+            for side in sides:
+                if SIDES[side] in line:
+                    self.set_ur_reverse_ready(
+                        side, True, f"reverse interface seen in {HARDWARE_LATEST_LOG}"
+                    )
 
     def start_hardware(self):
+        self.stop_demo()
+        self.ros_worker.publish_object_twist([0.0] * 6)
+        self.stop_object_nodes(start_after_cleanup=False)
         profile = self.robot_profile()
+        for side in self.selected_sides():
+            self.ur_reverse_ready[side] = False
+            self.refresh_status_label(side)
         args = [
             f"launch_ur_r:={'true' if self.arm_r.isChecked() else 'false'}",
             f"launch_ur_l:={'true' if self.arm_l.isChecked() else 'false'}",
@@ -870,7 +1077,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         command = " ".join([shlex.quote(HARDWARE_SCRIPT)] + [shlex.quote(arg) for arg in args])
         self.start_process("hardware", command, env)
 
-    def ensure_ur_ready(self, sides=None, on_success=None):
+    def ensure_ur_ready(self, sides=None, on_success=None, retry_count=0):
         if isinstance(sides, bool):
             sides = None
         selected = list(sides) if sides is not None else self.selected_sides()
@@ -890,19 +1097,38 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             )
         command = setup_prefix() + " && ".join(commands)
 
+        def retry(reason):
+            if retry_count >= UR_READY_RETRY_LIMIT:
+                self.append_log(
+                    "[gui] UR ready check failed after retry. Not arming motion. "
+                    f"Reason: {reason}"
+                )
+                return
+            self.append_log(
+                "[gui] UR ready check did not reach reverse-interface-ready; "
+                f"retrying once. Reason: {reason}"
+            )
+            QtCore.QTimer.singleShot(
+                1500,
+                lambda: self.ensure_ur_ready(
+                    sides=selected,
+                    on_success=on_success,
+                    retry_count=retry_count + 1,
+                ),
+            )
+
         def done(exit_code, _status):
             if exit_code == 0:
-                self.append_log(
-                    "[gui] UR ready check succeeded for: "
-                    + ", ".join(SIDES[side] for side in selected)
+                self._wait_for_ur_reverse_ready(
+                    selected,
+                    on_success=on_success,
+                    on_timeout=lambda missing: retry(
+                        "missing reverse interface for "
+                        + ", ".join(SIDES[side] for side in missing)
+                    ),
                 )
-                if on_success is not None:
-                    QtCore.QTimer.singleShot(200, on_success)
             else:
-                self.append_log(
-                    "[gui] UR ready check failed. Not arming motion. "
-                    "Check the Teach Pendant and dashboard logs."
-                )
+                retry("ensure_ur_ready script exited with failure")
 
         self.append_log(
             "[gui] Ensuring selected URs are running their External Control program: "
@@ -911,7 +1137,81 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.start_process("ensure_ur_ready", command, on_finished=done)
         return True
 
+    def _wait_for_ur_reverse_ready(self, sides, on_success=None, on_timeout=None):
+        deadline = time.monotonic() + UR_REVERSE_WAIT_SEC
+
+        def poll():
+            self._scan_latest_hardware_log_for_reverse_ready(sides)
+            missing = [side for side in sides if not self.ur_reverse_ready.get(side, False)]
+            if not missing:
+                self.append_log(
+                    "[gui] UR reverse interface ready for: "
+                    + ", ".join(SIDES[side] for side in sides)
+                )
+                if on_success is not None:
+                    QtCore.QTimer.singleShot(200, on_success)
+                return
+            if time.monotonic() >= deadline:
+                self.append_log(
+                    "[gui] UR ready check timed out waiting for reverse interface: "
+                    + ", ".join(SIDES[side] for side in missing)
+                )
+                if on_timeout is not None:
+                    on_timeout(missing)
+                return
+            QtCore.QTimer.singleShot(250, poll)
+
+        poll()
+
     def start_object_nodes(self):
+        self.stop_demo()
+        self.ros_worker.publish_object_twist([0.0] * 6)
+        self.stop_object_nodes(start_after_cleanup=True)
+
+    def stop_object_nodes(self, start_after_cleanup=False):
+        cleanup_process = self.processes.get("object_cleanup")
+        if cleanup_process is not None and cleanup_process.state() != QtCore.QProcess.NotRunning:
+            self.append_log("[gui] terminating previous object_cleanup")
+            cleanup_process.terminate()
+            if not cleanup_process.waitForFinished(1000):
+                cleanup_process.kill()
+
+        for name in ("object_state", "object_transform_r", "object_transform_l"):
+            process = self.processes.get(name)
+            if process is not None and process.state() != QtCore.QProcess.NotRunning:
+                self.append_log(f"[gui] terminating {name}")
+                process.terminate()
+                if not process.waitForFinished(1000):
+                    process.kill()
+
+        cleanup_patterns = [
+            "/match_cooperative_handling/[v]irtual_object_state_node",
+            "match_cooperative_handling [v]irtual_object_state_node",
+            "/match_cooperative_handling/[v]irtual_object_tcp_transform_node",
+            "match_cooperative_handling [v]irtual_object_tcp_transform_node",
+        ]
+        cleanup_cmd = " ; ".join(
+            f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true"
+            for pattern in cleanup_patterns
+        )
+        cleanup_cmd += " ; sleep 0.5 ; "
+        cleanup_cmd += " ; ".join(
+            f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
+            for pattern in cleanup_patterns
+        )
+
+        if start_after_cleanup:
+            self.append_log("[gui] Restarting virtual object nodes with a clean slate")
+            self.start_process(
+                "object_cleanup",
+                cleanup_cmd,
+                on_finished=lambda _code, _status: self._start_object_nodes_after_cleanup(),
+            )
+        else:
+            self.append_log("[gui] Stopping virtual object nodes")
+            self.start_process("object_cleanup", cleanup_cmd)
+
+    def _start_object_nodes_after_cleanup(self):
         robot = self.robot_name()
         state_cmd = (
             setup_prefix()
@@ -1185,6 +1485,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             status = self.arm_status.get(side, "unknown")
             if not (status == "ready" or status == "armed"):
                 blocked.append(f"{SIDES[side]}={status}")
+            if not self.ur_reverse_ready.get(side, False):
+                blocked.append(f"{SIDES[side]}=UR reverse missing")
         if blocked:
             self.append_log("[gui] Refusing start: " + ", ".join(blocked))
             return
@@ -1201,7 +1503,10 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
 
     def stop_managed_processes(self):
         self.stop_tracking_log()
+        self.stop_object_nodes(start_after_cleanup=False)
         for name, process in list(self.processes.items()):
+            if name == "object_cleanup":
+                continue
             if process.state() == QtCore.QProcess.NotRunning:
                 continue
             self.append_log(f"[gui] terminating {name}")

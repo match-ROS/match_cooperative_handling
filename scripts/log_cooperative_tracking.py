@@ -14,7 +14,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from rclpy.node import Node
 from rclpy.time import Time
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -120,6 +120,8 @@ class CooperativeTrackingLogger(Node):
         self.object_pose = None
         self.target_poses = {}
         self.reported_errors = {}
+        self.transform_status = {}
+        self.collision_status = {}
         self.last_tf_warning_time = {}
         self.stop_requested = False
 
@@ -154,6 +156,18 @@ class CooperativeTrackingLogger(Node):
                 lambda msg, side=arm: self._pose_error_cb(side, msg),
                 10,
             )
+            self.create_subscription(
+                String,
+                f"/{self.robot_name}/{prefix}/virtual_object_tcp_transform_node/status",
+                lambda msg, side=arm: self._transform_status_cb(side, msg),
+                10,
+            )
+            self.create_subscription(
+                String,
+                f"/{self.robot_name}/{prefix}/integrated_cartesian_admittance_controller/collision_status",
+                lambda msg, side=arm: self._collision_status_cb(side, msg),
+                10,
+            )
 
         self.get_logger().info(f"Tracking arms: {','.join(self.arms)}")
         self.get_logger().info(f"Writing CSV log to {self.csv_path}")
@@ -186,6 +200,12 @@ class CooperativeTrackingLogger(Node):
             "ry": angular.y,
             "rz": angular.z,
         }
+
+    def _transform_status_cb(self, arm, msg):
+        self.transform_status[arm] = msg.data
+
+    def _collision_status_cb(self, arm, msg):
+        self.collision_status[arm] = msg.data
 
     def lookup_actual_pose(self, arm):
         prefix = SIDES[arm]
@@ -233,6 +253,8 @@ class CooperativeTrackingLogger(Node):
                     "orientation_error_norm_rad",
                     "reported_position_error_norm",
                     "reported_orientation_error_norm_rad",
+                    "transform_status",
+                    "collision_status",
                     "tf_ok",
                     "target_ok",
                 ],
@@ -286,6 +308,8 @@ class CooperativeTrackingLogger(Node):
                         "orientation_error_norm_rad": error[7],
                         "reported_position_error_norm": finite_or_none(reported.get("pos")),
                         "reported_orientation_error_norm_rad": finite_or_none(reported.get("ori")),
+                        "transform_status": self.transform_status.get(arm, ""),
+                        "collision_status": self.collision_status.get(arm, ""),
                         "tf_ok": tf_ok,
                         "target_ok": target is not None,
                     }
