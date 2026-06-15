@@ -722,6 +722,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.processes = {}
         self.arm_status = {"r": "unknown", "l": "unknown"}
         self.ur_reverse_ready = {"r": False, "l": False}
+        self.ur_ready_log_scan_start = None
         self.freedrive_active = {"r": False, "l": False}
 
         self.ros_worker = RosWorker("mur620")
@@ -744,7 +745,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         root.addLayout(actions)
         for button in (
             self._button("Start Hardware", self.start_hardware),
-            self._button("Ensure UR Ready", self.ensure_ur_ready),
+            self._button("Enable URs / Ready", self.ensure_ur_ready),
             self._button("Start Object Nodes", self.start_object_nodes),
             self._button("Set From TCP", self.set_from_tcp),
             self._button("Home L", partial(self.move_home, "l")),
@@ -1011,12 +1012,22 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 if prefix in line:
                     self.set_ur_reverse_ready(side, False, "SetMode goal rejected")
 
-    def _scan_latest_hardware_log_for_reverse_ready(self, sides):
+    def _hardware_log_size(self):
+        try:
+            return os.path.getsize(HARDWARE_LATEST_LOG)
+        except OSError:
+            return None
+
+    def _scan_latest_hardware_log_for_reverse_ready(self, sides, since_offset=None):
         try:
             with open(HARDWARE_LATEST_LOG, "rb") as log_file:
                 log_file.seek(0, os.SEEK_END)
                 size = log_file.tell()
-                log_file.seek(max(0, size - 512_000), os.SEEK_SET)
+                if since_offset is None:
+                    start = max(0, size - 512_000)
+                else:
+                    start = since_offset if since_offset <= size else 0
+                log_file.seek(start, os.SEEK_SET)
                 text = log_file.read().decode(errors="replace")
         except OSError:
             return
@@ -1084,6 +1095,10 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         if not selected:
             self.append_log("[gui] Refusing UR ready check: no arm selected")
             return False
+        if retry_count == 0:
+            self.ur_ready_log_scan_start = self._hardware_log_size()
+            for side in selected:
+                self.set_ur_reverse_ready(side, False, "manual enable/check requested")
         robot = self.robot_name()
         commands = []
         for side in selected:
@@ -1141,7 +1156,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         deadline = time.monotonic() + UR_REVERSE_WAIT_SEC
 
         def poll():
-            self._scan_latest_hardware_log_for_reverse_ready(sides)
+            self._scan_latest_hardware_log_for_reverse_ready(
+                sides, since_offset=self.ur_ready_log_scan_start
+            )
             missing = [side for side in sides if not self.ur_reverse_ready.get(side, False)]
             if not missing:
                 self.append_log(
