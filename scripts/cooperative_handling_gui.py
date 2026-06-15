@@ -12,9 +12,14 @@ from functools import partial
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import rclpy
-from controller_manager_msgs.srv import ListControllers, SwitchController
+from controller_manager_msgs.srv import (
+    ConfigureController,
+    ListControllers,
+    LoadController,
+    SwitchController,
+)
 from geometry_msgs.msg import TwistStamped
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
 
@@ -24,6 +29,7 @@ HARDWARE_SCRIPT = os.path.join(
 )
 PACKAGE = "match_cooperative_handling"
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
+FREEDRIVE_CONTROLLER = "freedrive_mode_controller"
 MOTION_CONTROLLERS = [
     "integrated_cartesian_admittance_controller",
     "forward_velocity_controller",
@@ -34,7 +40,7 @@ MOTION_CONTROLLERS = [
     "force_mode_controller",
     "passthrough_trajectory_controller",
     "tool_contact_controller",
-    "freedrive_mode_controller",
+    FREEDRIVE_CONTROLLER,
 ]
 
 
@@ -59,8 +65,10 @@ class RosWorker(QtCore.QThread):
         self.robot_name = robot_name
         self._node = None
         self._object_twist_pub = None
+        self._tracking_stop_pub = None
         self._status_subs = []
         self._previous_freedrive_controllers = {}
+        self._freedrive_enable_pubs = {}
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -70,6 +78,9 @@ class RosWorker(QtCore.QThread):
         self._node = rclpy.create_node("cooperative_handling_gui")
         self._object_twist_pub = self._node.create_publisher(
             TwistStamped, "/virtual_object/object_twist_cmd", 10
+        )
+        self._tracking_stop_pub = self._node.create_publisher(
+            Bool, "/cooperative_tracking_logger/stop", 10
         )
         self._configure_status_subscriptions(self.robot_name)
         self._ready.set()
@@ -158,6 +169,83 @@ class RosWorker(QtCore.QThread):
             return None, f"empty list_controllers response from {controller_manager}"
         return {controller.name: controller.state for controller in response.controller}, ""
 
+    def _load_controller(self, controller_manager, controller_name):
+        with self._lock:
+            client = self._node.create_client(LoadController, f"{controller_manager}/load_controller")
+        if not client.wait_for_service(timeout_sec=2.0):
+            return False, f"service unavailable: {controller_manager}/load_controller"
+        request = LoadController.Request()
+        request.name = controller_name
+        future = client.call_async(request)
+        if not self._wait_for_future(future, 3.0):
+            return False, f"timeout loading {controller_name}"
+        response = future.result()
+        if response is None or not response.ok:
+            return False, f"failed loading {controller_name}"
+        return True, f"loaded {controller_name}"
+
+    def _configure_controller(self, controller_manager, controller_name):
+        with self._lock:
+            client = self._node.create_client(
+                ConfigureController, f"{controller_manager}/configure_controller"
+            )
+        if not client.wait_for_service(timeout_sec=2.0):
+            return False, f"service unavailable: {controller_manager}/configure_controller"
+        request = ConfigureController.Request()
+        request.name = controller_name
+        future = client.call_async(request)
+        if not self._wait_for_future(future, 3.0):
+            return False, f"timeout configuring {controller_name}"
+        response = future.result()
+        if response is None or not response.ok:
+            return False, f"failed configuring {controller_name}"
+        return True, f"configured {controller_name}"
+
+    def _ensure_controller_loaded(self, controller_manager, controller_name):
+        states, error = self._list_controller_states(controller_manager)
+        if states is None:
+            return None, error
+        if controller_name not in states:
+            ok, message = self._load_controller(controller_manager, controller_name)
+            self.log.emit(f"[ros] {controller_name}: {message}")
+            if not ok:
+                return None, message
+            states, error = self._list_controller_states(controller_manager)
+            if states is None:
+                return None, error
+
+        if states.get(controller_name) == "unconfigured":
+            ok, message = self._configure_controller(controller_manager, controller_name)
+            self.log.emit(f"[ros] {controller_name}: {message}")
+            if not ok:
+                return None, message
+            states, error = self._list_controller_states(controller_manager)
+            if states is None:
+                return None, error
+        return states, ""
+
+    def _freedrive_enable_topic(self, robot_name, side):
+        return f"/{robot_name}/{SIDES[side]}/{FREEDRIVE_CONTROLLER}/enable_freedrive_mode"
+
+    def _publish_freedrive_enable(self, robot_name, side, enabled):
+        topic = self._freedrive_enable_topic(robot_name, side)
+        with self._lock:
+            publisher = self._freedrive_enable_pubs.get(topic)
+            if publisher is None:
+                publisher = self._node.create_publisher(Bool, topic, 10)
+                self._freedrive_enable_pubs[topic] = publisher
+
+        deadline = time.monotonic() + 1.0
+        while publisher.get_subscription_count() == 0 and time.monotonic() < deadline:
+            self.msleep(20)
+
+        msg = Bool()
+        msg.data = bool(enabled)
+        for _ in range(10):
+            publisher.publish(msg)
+            self.msleep(20)
+        self.log.emit(f"[ros] Published {msg.data} on {topic}")
+
     def _switch_controllers(self, controller_manager, activate, deactivate, label):
         with self._lock:
             client = self._node.create_client(SwitchController, f"{controller_manager}/switch_controller")
@@ -202,7 +290,7 @@ class RosWorker(QtCore.QThread):
         controller_manager = self._controller_manager(robot_name, side)
         key = (robot_name, side)
         if enable:
-            states, error = self._list_controller_states(controller_manager)
+            states, error = self._ensure_controller_loaded(controller_manager, FREEDRIVE_CONTROLLER)
             if states is None:
                 self.log.emit(f"[ros] Freedrive {SIDES[side]}: {error}")
                 self.freedrive_status.emit(side, False, error)
@@ -210,7 +298,7 @@ class RosWorker(QtCore.QThread):
             active_motion = [
                 name
                 for name in MOTION_CONTROLLERS
-                if name != "freedrive_mode_controller" and states.get(name) == "active"
+                if name != FREEDRIVE_CONTROLLER and states.get(name) == "active"
             ]
             if active_motion:
                 self._previous_freedrive_controllers[key] = active_motion
@@ -218,20 +306,24 @@ class RosWorker(QtCore.QThread):
                 self._previous_freedrive_controllers[key] = [fallback_controller]
             ok, message = self._switch_controllers(
                 controller_manager,
-                activate=["freedrive_mode_controller"],
+                activate=[FREEDRIVE_CONTROLLER],
                 deactivate=active_motion,
                 label=f"Freedrive ON {SIDES[side]}",
             )
+            if ok:
+                self._publish_freedrive_enable(robot_name, side, True)
+                message += "; enable_freedrive_mode=true sent"
             self.log.emit(f"[ros] {message}")
             self.freedrive_status.emit(side, ok, message)
             return
 
         restore = self._previous_freedrive_controllers.get(key) or [fallback_controller]
-        restore = [name for name in restore if name and name != "freedrive_mode_controller"]
+        restore = [name for name in restore if name and name != FREEDRIVE_CONTROLLER]
+        self._publish_freedrive_enable(robot_name, side, False)
         ok, message = self._switch_controllers(
             controller_manager,
             activate=restore,
-            deactivate=["freedrive_mode_controller"],
+            deactivate=[FREEDRIVE_CONTROLLER],
             label=f"Freedrive OFF {SIDES[side]}",
         )
         self.log.emit(f"[ros] {message}")
@@ -250,6 +342,15 @@ class RosWorker(QtCore.QThread):
         msg.twist.angular.y = float(values[4])
         msg.twist.angular.z = float(values[5])
         self._object_twist_pub.publish(msg)
+
+    def publish_tracking_stop(self):
+        if self._tracking_stop_pub is None:
+            return
+        msg = Bool()
+        msg.data = True
+        for _ in range(5):
+            self._tracking_stop_pub.publish(msg)
+            self.msleep(20)
 
 
 class ObjectJogDialog(QtWidgets.QDialog):
@@ -494,6 +595,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         root.addLayout(actions)
         for button in (
             self._button("Start Hardware", self.start_hardware),
+            self._button("Ensure UR Ready", self.ensure_ur_ready),
             self._button("Start Object Nodes", self.start_object_nodes),
             self._button("Set From TCP", self.set_from_tcp),
             self._button("Home L", partial(self.move_home, "l")),
@@ -578,7 +680,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.opt_require_wrench = self._check("Require wrench", False)
         self.opt_collision = self._check("Collision avoidance", True)
         self.opt_markers = self._check("Collision markers", False)
-        self.opt_zero_admittance = self._check("Zero admittance", True)
+        self.opt_zero_admittance = self._check("Zero admittance", False)
         self.opt_moveit = self._check("Launch MoveIt", True)
         self.moveit_speed_label = QtWidgets.QLabel("MoveIt speed: 20%")
         self.moveit_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -697,7 +799,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.terminal.appendPlainText(text.rstrip())
         self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
 
-    def start_process(self, name, command, env=None):
+    def start_process(self, name, command, env=None, on_finished=None):
         if name in self.processes and self.processes[name].state() != QtCore.QProcess.NotRunning:
             self.append_log(f"[gui] {name} already running")
             return
@@ -716,6 +818,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 f"[{tag}] finished exit_code={code}, status={int(status)}"
             )
         )
+        if on_finished is not None:
+            process.finished.connect(on_finished)
         self.processes[name] = process
         self.append_log(f"[{name}] $ {command}")
         process.start("bash", ["-lc", command])
@@ -766,12 +870,54 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         command = " ".join([shlex.quote(HARDWARE_SCRIPT)] + [shlex.quote(arg) for arg in args])
         self.start_process("hardware", command, env)
 
+    def ensure_ur_ready(self, sides=None, on_success=None):
+        if isinstance(sides, bool):
+            sides = None
+        selected = list(sides) if sides is not None else self.selected_sides()
+        if not selected:
+            self.append_log("[gui] Refusing UR ready check: no arm selected")
+            return False
+        robot = self.robot_name()
+        commands = []
+        for side in selected:
+            prefix = SIDES[side]
+            commands.append(
+                "ros2 run match_cooperative_handling ensure_ur_ready.py --ros-args "
+                + f"-p arm_namespace:=/{robot}/{prefix} "
+                + "-p wait_timeout:=30.0 "
+                + "-p target_robot_mode:=7 "
+                + "-p allow_stop_restart:=true"
+            )
+        command = setup_prefix() + " && ".join(commands)
+
+        def done(exit_code, _status):
+            if exit_code == 0:
+                self.append_log(
+                    "[gui] UR ready check succeeded for: "
+                    + ", ".join(SIDES[side] for side in selected)
+                )
+                if on_success is not None:
+                    QtCore.QTimer.singleShot(200, on_success)
+            else:
+                self.append_log(
+                    "[gui] UR ready check failed. Not arming motion. "
+                    "Check the Teach Pendant and dashboard logs."
+                )
+
+        self.append_log(
+            "[gui] Ensuring selected URs are running their External Control program: "
+            + ", ".join(SIDES[side] for side in selected)
+        )
+        self.start_process("ensure_ur_ready", command, on_finished=done)
+        return True
+
     def start_object_nodes(self):
         robot = self.robot_name()
         state_cmd = (
             setup_prefix()
             + "exec ros2 run match_cooperative_handling virtual_object_state_node --ros-args "
-            + f"-p world_frame:={robot}/base_link"
+            + f"-p world_frame:={robot}/base_link "
+            + "-p rate:=500.0"
         )
         self.start_process("object_state", state_cmd)
         for side in self.selected_sides():
@@ -781,7 +927,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 + "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
                 + f"-r __ns:=/{robot}/{prefix} "
                 + f"-p robot_name:={robot} "
-                + f"-p arm:={side}"
+                + f"-p arm:={side} "
+                + "-p rate:=500.0"
             )
             self.start_process(f"object_transform_{side}", transform_cmd)
 
@@ -906,7 +1053,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         robot = self.robot_name()
         cmd = (
             setup_prefix()
-            + "exec ros2 run match_cooperative_handling virtual_object_demo_runner.py --ros-args "
+            + "exec ros2 run match_cooperative_handling virtual_object_demo_runner --ros-args "
             + f"-p robot_name:={robot} "
             + f"-p world_frame:={robot}/base_link "
             + f"-p demo_name:={demo_name} "
@@ -915,7 +1062,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             + f"-p yaw_amplitude_deg:={yaw_amplitude_deg:.3f} "
             + f"-p linear_velocity:={linear_velocity:.4f} "
             + f"-p angular_velocity:={angular_velocity:.4f} "
-            + f"-p repetitions:={int(repetitions)}"
+            + f"-p repetitions:={int(repetitions)} "
+            + "-p publish_rate_hz:=500.0"
         )
         self.append_log(
             "[gui] Starting demo. The demo only publishes virtual object twist commands."
@@ -955,6 +1103,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         process = self.processes.get("tracking_log")
         if process is not None and process.state() != QtCore.QProcess.NotRunning:
             self.append_log("[gui] stopping tracking logger")
+            self.ros_worker.publish_tracking_stop()
+            if process.waitForFinished(2000):
+                return
             process.terminate()
             if not process.waitForFinished(1000):
                 process.kill()
@@ -1026,6 +1177,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 "[gui] Refusing start: disable freedrive first for " + ", ".join(freedrive)
             )
             return
+        self.ensure_ur_ready(sides=sides, on_success=lambda: self._start_motion_after_ready(sides))
+
+    def _start_motion_after_ready(self, sides):
         blocked = []
         for side in sides:
             status = self.arm_status.get(side, "unknown")

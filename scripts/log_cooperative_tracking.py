@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import signal
 import statistics
 import time
 from collections import defaultdict
@@ -13,6 +14,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from rclpy.node import Node
 from rclpy.time import Time
+from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -112,10 +114,14 @@ class CooperativeTrackingLogger(Node):
         self.object_pose_topic = self.declare_parameter(
             "object_pose_topic", "/virtual_object/object_pose"
         ).value
+        self.stop_topic = self.declare_parameter(
+            "stop_topic", "/cooperative_tracking_logger/stop"
+        ).value
         self.object_pose = None
         self.target_poses = {}
         self.reported_errors = {}
         self.last_tf_warning_time = {}
+        self.stop_requested = False
 
         os.makedirs(self.output_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -132,6 +138,7 @@ class CooperativeTrackingLogger(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.create_subscription(PoseStamped, self.object_pose_topic, self._object_pose_cb, 10)
+        self.create_subscription(Bool, self.stop_topic, self._stop_cb, 10)
 
         for arm in self.arms:
             prefix = SIDES[arm]
@@ -151,9 +158,15 @@ class CooperativeTrackingLogger(Node):
         self.get_logger().info(f"Tracking arms: {','.join(self.arms)}")
         self.get_logger().info(f"Writing CSV log to {self.csv_path}")
         self.get_logger().info(f"Writing summary to {self.summary_path}")
+        self.get_logger().info(f"Stop topic: {self.stop_topic}")
 
     def _object_pose_cb(self, msg):
         self.object_pose = msg
+
+    def _stop_cb(self, msg):
+        if msg.data:
+            self.get_logger().info("Stop requested via stop topic.")
+            self.stop_requested = True
 
     def _target_pose_cb(self, arm, msg):
         self.target_poses[arm] = msg
@@ -225,7 +238,7 @@ class CooperativeTrackingLogger(Node):
                 ],
             )
             writer.writeheader()
-            while rclpy.ok():
+            while rclpy.ok() and not self.stop_requested:
                 now = self.get_clock().now()
                 elapsed = (now - start_time).nanoseconds * 1.0e-9
                 if self.duration > 0.0 and elapsed > self.duration:
@@ -329,10 +342,10 @@ class CooperativeTrackingLogger(Node):
 def main():
     rclpy.init()
     node = CooperativeTrackingLogger()
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: setattr(node, "stop_requested", True))
+    signal.signal(signal.SIGINT, lambda _signum, _frame: setattr(node, "stop_requested", True))
     try:
         raise SystemExit(node.run())
-    except KeyboardInterrupt:
-        raise SystemExit(130)
     finally:
         node.destroy_node()
         rclpy.shutdown()

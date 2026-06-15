@@ -22,6 +22,12 @@ ament_target_dependencies(virtual_object_state_node
   tf2_ros
 )
 
+add_executable(virtual_object_demo_runner src/virtual_object_demo_runner.cpp)
+ament_target_dependencies(virtual_object_demo_runner
+  geometry_msgs
+  rclcpp
+)
+
 add_executable(virtual_object_tcp_transform_node src/virtual_object_tcp_transform_node.cpp)
 ament_target_dependencies(virtual_object_tcp_transform_node
   geometry_msgs
@@ -34,6 +40,7 @@ ament_target_dependencies(virtual_object_tcp_transform_node
 )
 
 install(TARGETS
+  virtual_object_demo_runner
   virtual_object_state_node
   virtual_object_tcp_transform_node
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -41,6 +48,7 @@ install(TARGETS
 
 install(PROGRAMS
   scripts/cooperative_handling_gui.py
+  scripts/ensure_ur_ready.py
   scripts/log_cooperative_tracking.py
   scripts/move_arm_to_named_pose.py
   scripts/set_relative_pose_from_current_object.py
