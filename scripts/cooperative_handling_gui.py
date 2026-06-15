@@ -285,6 +285,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         root.addLayout(tools)
         for button in (
             self._button("Open RViz", self.open_rviz),
+            self._button("Set Object Center", self.set_object_center),
+            self._button("Set Current Offsets", self.set_current_offsets),
         ):
             tools.addWidget(button)
         tools.addStretch(1)
@@ -522,6 +524,48 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             + f"-p arm:={side}"
         )
         self.start_process(f"set_from_tcp_{side}", cmd)
+
+    def set_object_center(self):
+        sides = self.selected_sides()
+        if len(sides) < 2:
+            self.append_log("[gui] Refusing object center: select at least two manipulators")
+            return
+        robot = self.robot_name()
+        arms = ",".join(sides)
+        cmd = (
+            setup_prefix()
+            + "exec ros2 run match_cooperative_handling "
+            + "set_virtual_object_from_manipulators.py --ros-args "
+            + f"-p robot_name:={robot} "
+            + f"-p arms:={arms} "
+            + f"-p world_frame:={robot}/base_link"
+        )
+        self.append_log(
+            f"[gui] Setting virtual object center from selected manipulators: {arms}"
+        )
+        self.start_process("set_object_center", cmd)
+
+    def set_current_offsets(self):
+        sides = self.selected_sides()
+        if not sides:
+            self.append_log("[gui] Refusing current offsets: select at least one manipulator")
+            return
+        robot = self.robot_name()
+        arms = ",".join(sides)
+        cmd = (
+            setup_prefix()
+            + "exec ros2 run match_cooperative_handling "
+            + "set_relative_pose_from_current_object.py --ros-args "
+            + f"-p robot_name:={robot} "
+            + f"-p arms:={arms} "
+            + f"-p world_frame:={robot}/base_link "
+            + "-p object_frame:=virtual_object/base_link "
+            + "-p max_distance:=2.0"
+        )
+        self.append_log(
+            f"[gui] Setting current object-relative TCP offsets for: {arms}"
+        )
+        self.start_process("set_current_offsets", cmd)
 
     def open_object_jog(self):
         dialog = ObjectJogDialog(self.ros_worker, self)
