@@ -41,10 +41,12 @@ install(TARGETS
 
 install(PROGRAMS
   scripts/cooperative_handling_gui.py
+  scripts/log_cooperative_tracking.py
   scripts/move_arm_to_named_pose.py
   scripts/set_relative_pose_from_current_object.py
   scripts/set_virtual_object_from_manipulators.py
   scripts/set_virtual_object_from_tcp.py
+  scripts/virtual_object_demo_runner.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

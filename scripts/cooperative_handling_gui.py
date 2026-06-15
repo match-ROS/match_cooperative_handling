@@ -6,11 +6,13 @@ import shlex
 import signal
 import sys
 import threading
+import time
 from functools import partial
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import rclpy
+from controller_manager_msgs.srv import ListControllers, SwitchController
 from geometry_msgs.msg import TwistStamped
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -22,6 +24,18 @@ HARDWARE_SCRIPT = os.path.join(
 )
 PACKAGE = "match_cooperative_handling"
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
+MOTION_CONTROLLERS = [
+    "integrated_cartesian_admittance_controller",
+    "forward_velocity_controller",
+    "scaled_joint_trajectory_controller",
+    "joint_trajectory_controller",
+    "forward_position_controller",
+    "forward_effort_controller",
+    "force_mode_controller",
+    "passthrough_trajectory_controller",
+    "tool_contact_controller",
+    "freedrive_mode_controller",
+]
 
 
 def setup_prefix():
@@ -38,6 +52,7 @@ def setup_prefix():
 class RosWorker(QtCore.QThread):
     log = QtCore.pyqtSignal(str)
     status = QtCore.pyqtSignal(str, str)
+    freedrive_status = QtCore.pyqtSignal(str, bool, str)
 
     def __init__(self, robot_name="mur620d"):
         super().__init__()
@@ -45,6 +60,7 @@ class RosWorker(QtCore.QThread):
         self._node = None
         self._object_twist_pub = None
         self._status_subs = []
+        self._previous_freedrive_controllers = {}
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -113,6 +129,113 @@ class RosWorker(QtCore.QThread):
                 self.log.emit(f"[ros] {label}: failed: {exc}")
 
         future.add_done_callback(done)
+
+    def _duration_msg(self, seconds):
+        duration = SwitchController.Request().timeout
+        duration.sec = int(seconds)
+        duration.nanosec = int((seconds - int(seconds)) * 1_000_000_000)
+        return duration
+
+    def _wait_for_future(self, future, timeout_sec):
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            self.msleep(20)
+        return future.done()
+
+    def _controller_manager(self, robot_name, side):
+        return f"/{robot_name}/{SIDES[side]}/controller_manager"
+
+    def _list_controller_states(self, controller_manager):
+        with self._lock:
+            client = self._node.create_client(ListControllers, f"{controller_manager}/list_controllers")
+        if not client.wait_for_service(timeout_sec=1.0):
+            return None, f"service unavailable: {controller_manager}/list_controllers"
+        future = client.call_async(ListControllers.Request())
+        if not self._wait_for_future(future, 2.0):
+            return None, f"timeout listing controllers at {controller_manager}"
+        response = future.result()
+        if response is None:
+            return None, f"empty list_controllers response from {controller_manager}"
+        return {controller.name: controller.state for controller in response.controller}, ""
+
+    def _switch_controllers(self, controller_manager, activate, deactivate, label):
+        with self._lock:
+            client = self._node.create_client(SwitchController, f"{controller_manager}/switch_controller")
+        if not client.wait_for_service(timeout_sec=2.0):
+            return False, f"{label}: service unavailable: {controller_manager}/switch_controller"
+
+        states, error = self._list_controller_states(controller_manager)
+        if states is not None:
+            activate = [name for name in activate if states.get(name) != "active"]
+            deactivate = [name for name in deactivate if states.get(name) == "active"]
+        if not activate and not deactivate:
+            return True, f"{label}: controller state already correct"
+
+        request = SwitchController.Request()
+        request.activate_controllers = activate
+        request.deactivate_controllers = deactivate
+        request.strictness = SwitchController.Request.BEST_EFFORT
+        request.activate_asap = True
+        request.timeout = self._duration_msg(5.0)
+        self.log.emit(f"[ros] {label}: activate={activate}, deactivate={deactivate}")
+        future = client.call_async(request)
+        if not self._wait_for_future(future, 6.0):
+            return False, f"{label}: timeout while switching controllers"
+        response = future.result()
+        if response is None or not response.ok:
+            message = "" if response is None else response.message
+            return False, f"{label}: switch failed: {message}"
+        return True, f"{label}: switch ok"
+
+    def switch_freedrive(self, robot_name, side, enable, fallback_controller):
+        thread = threading.Thread(
+            target=self._switch_freedrive_worker,
+            args=(robot_name, side, enable, fallback_controller),
+            daemon=True,
+        )
+        thread.start()
+
+    def _switch_freedrive_worker(self, robot_name, side, enable, fallback_controller):
+        if not self._ready.wait(timeout=1.0):
+            self.log.emit(f"[ros] Cannot switch freedrive for {SIDES[side]}: ROS helper not ready")
+            return
+        controller_manager = self._controller_manager(robot_name, side)
+        key = (robot_name, side)
+        if enable:
+            states, error = self._list_controller_states(controller_manager)
+            if states is None:
+                self.log.emit(f"[ros] Freedrive {SIDES[side]}: {error}")
+                self.freedrive_status.emit(side, False, error)
+                return
+            active_motion = [
+                name
+                for name in MOTION_CONTROLLERS
+                if name != "freedrive_mode_controller" and states.get(name) == "active"
+            ]
+            if active_motion:
+                self._previous_freedrive_controllers[key] = active_motion
+            elif key not in self._previous_freedrive_controllers:
+                self._previous_freedrive_controllers[key] = [fallback_controller]
+            ok, message = self._switch_controllers(
+                controller_manager,
+                activate=["freedrive_mode_controller"],
+                deactivate=active_motion,
+                label=f"Freedrive ON {SIDES[side]}",
+            )
+            self.log.emit(f"[ros] {message}")
+            self.freedrive_status.emit(side, ok, message)
+            return
+
+        restore = self._previous_freedrive_controllers.get(key) or [fallback_controller]
+        restore = [name for name in restore if name and name != "freedrive_mode_controller"]
+        ok, message = self._switch_controllers(
+            controller_manager,
+            activate=restore,
+            deactivate=["freedrive_mode_controller"],
+            label=f"Freedrive OFF {SIDES[side]}",
+        )
+        self.log.emit(f"[ros] {message}")
+        self.freedrive_status.emit(side, False if ok else True, message)
 
     def publish_object_twist(self, values):
         if self._object_twist_pub is None:
@@ -245,6 +368,103 @@ class ObjectJogDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+class DemoDialog(QtWidgets.QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("Cooperative Handling Demos")
+        self.setMinimumWidth(520)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        demo_box = QtWidgets.QGroupBox("Demo")
+        demo_layout = QtWidgets.QVBoxLayout(demo_box)
+        self.demo_combo = QtWidgets.QComboBox()
+        self.demo_combo.addItem("Safe Wiggle", "safe_wiggle")
+        demo_layout.addWidget(self.demo_combo)
+        catalog = QtWidgets.QLabel(
+            "Prepared next: Rounded Rectangle, Ellipse/Figure Eight, Tilt Demo, Teach Workspace"
+        )
+        catalog.setWordWrap(True)
+        demo_layout.addWidget(catalog)
+        layout.addWidget(demo_box)
+
+        params = QtWidgets.QGroupBox("Safe Wiggle Parameters")
+        form = QtWidgets.QFormLayout(params)
+        self.xy_amplitude = QtWidgets.QDoubleSpinBox()
+        self.xy_amplitude.setRange(0.001, 0.2)
+        self.xy_amplitude.setDecimals(3)
+        self.xy_amplitude.setSingleStep(0.005)
+        self.xy_amplitude.setValue(0.05)
+        form.addRow("XY amplitude [m]", self.xy_amplitude)
+
+        self.z_lift = QtWidgets.QDoubleSpinBox()
+        self.z_lift.setRange(0.001, 0.2)
+        self.z_lift.setDecimals(3)
+        self.z_lift.setSingleStep(0.005)
+        self.z_lift.setValue(0.05)
+        form.addRow("Z lift [m]", self.z_lift)
+
+        self.yaw_amplitude = QtWidgets.QDoubleSpinBox()
+        self.yaw_amplitude.setRange(0.1, 30.0)
+        self.yaw_amplitude.setDecimals(1)
+        self.yaw_amplitude.setSingleStep(1.0)
+        self.yaw_amplitude.setValue(5.0)
+        form.addRow("Yaw amplitude [deg]", self.yaw_amplitude)
+
+        self.linear_velocity = QtWidgets.QDoubleSpinBox()
+        self.linear_velocity.setRange(0.001, 0.15)
+        self.linear_velocity.setDecimals(3)
+        self.linear_velocity.setSingleStep(0.005)
+        self.linear_velocity.setValue(0.02)
+        form.addRow("Linear velocity [m/s]", self.linear_velocity)
+
+        self.angular_velocity = QtWidgets.QDoubleSpinBox()
+        self.angular_velocity.setRange(0.01, 0.8)
+        self.angular_velocity.setDecimals(3)
+        self.angular_velocity.setSingleStep(0.05)
+        self.angular_velocity.setValue(0.10)
+        form.addRow("Angular velocity [rad/s]", self.angular_velocity)
+
+        self.repetitions = QtWidgets.QSpinBox()
+        self.repetitions.setRange(1, 20)
+        self.repetitions.setValue(1)
+        form.addRow("Repetitions", self.repetitions)
+        layout.addWidget(params)
+
+        hint = QtWidgets.QLabel(
+            "Demos do not arm the robot. Press START MOTION first, then start a demo."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QtWidgets.QHBoxLayout()
+        start = QtWidgets.QPushButton("Start Demo")
+        start.setMinimumHeight(42)
+        start.clicked.connect(self.start_demo)
+        stop = QtWidgets.QPushButton("Stop Demo")
+        stop.setMinimumHeight(42)
+        stop.clicked.connect(self.main_window.stop_demo)
+        buttons.addWidget(start)
+        buttons.addWidget(stop)
+        layout.addLayout(buttons)
+
+    def start_demo(self):
+        self.main_window.start_demo(
+            demo_name=self.demo_combo.currentData(),
+            xy_amplitude=self.xy_amplitude.value(),
+            z_lift=self.z_lift.value(),
+            yaw_amplitude_deg=self.yaw_amplitude.value(),
+            linear_velocity=self.linear_velocity.value(),
+            angular_velocity=self.angular_velocity.value(),
+            repetitions=self.repetitions.value(),
+        )
+
+    def closeEvent(self, event):
+        self.main_window.stop_demo()
+        super().closeEvent(event)
+
+
 class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -252,10 +472,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.resize(1180, 780)
         self.processes = {}
         self.arm_status = {"r": "unknown", "l": "unknown"}
+        self.freedrive_active = {"r": False, "l": False}
 
         self.ros_worker = RosWorker("mur620")
         self.ros_worker.log.connect(self.append_log)
         self.ros_worker.status.connect(self.update_arm_status)
+        self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
         self.ros_worker.start()
 
         central = QtWidgets.QWidget()
@@ -277,14 +499,21 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self._button("Home L", partial(self.move_home, "l")),
             self._button("Home R", partial(self.move_home, "r")),
             self._button("Open Object Jog", self.open_object_jog),
+            self._button("Freedrive", self.toggle_freedrive),
             self._button("Stop Managed Processes", self.stop_managed_processes),
         ):
             actions.addWidget(button)
+            if button.text() == "Freedrive":
+                self.freedrive_button = button
+                self.update_freedrive_button()
 
         tools = QtWidgets.QHBoxLayout()
         root.addLayout(tools)
         for button in (
             self._button("Open RViz", self.open_rviz),
+            self._button("Demos", self.open_demos),
+            self._button("Start Tracking Log", self.start_tracking_log),
+            self._button("Stop Tracking Log", self.stop_tracking_log),
             self._button("Set Object Center", self.set_object_center),
             self._button("Set Current Offsets", self.set_current_offsets),
         ):
@@ -332,8 +561,10 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         layout.addRow("ROS name", self.ros_name_edit)
         self.arm_r = QtWidgets.QCheckBox("UR10_r")
         self.arm_r.setChecked(True)
+        self.arm_r.toggled.connect(lambda _checked: self.update_freedrive_button())
         self.arm_l = QtWidgets.QCheckBox("UR10_l")
         self.arm_l.setChecked(True)
+        self.arm_l.toggled.connect(lambda _checked: self.update_freedrive_button())
         layout.addRow(self.arm_r)
         layout.addRow(self.arm_l)
         return box
@@ -347,6 +578,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.opt_require_wrench = self._check("Require wrench", False)
         self.opt_collision = self._check("Collision avoidance", True)
         self.opt_markers = self._check("Collision markers", False)
+        self.opt_zero_admittance = self._check("Zero admittance", True)
         self.opt_moveit = self._check("Launch MoveIt", True)
         self.moveit_speed_label = QtWidgets.QLabel("MoveIt speed: 20%")
         self.moveit_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -361,6 +593,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 self.opt_require_wrench,
                 self.opt_collision,
                 self.opt_markers,
+                self.opt_zero_admittance,
                 self.opt_moveit,
             ]
         ):
@@ -372,6 +605,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self.opt_require_wrench,
             self.opt_collision,
             self.opt_markers,
+            self.opt_zero_admittance,
             self.opt_moveit,
         ]) + 1) // 2
         layout.addWidget(self.moveit_speed_label, row, 0)
@@ -417,6 +651,11 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             sides.append("l")
         return sides
 
+    def fallback_motion_controller(self):
+        if self.opt_integrated.isChecked():
+            return "integrated_cartesian_admittance_controller"
+        return "forward_velocity_controller"
+
     def on_ros_name_changed(self):
         self.ros_worker.set_robot_name(self.robot_name())
         self.arm_status = {"r": "unknown", "l": "unknown"}
@@ -426,6 +665,33 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def update_arm_status(self, side, status):
         self.arm_status[side] = status
         (self.status_r if side == "r" else self.status_l).setText(status)
+
+    def update_freedrive_status(self, side, active, message):
+        self.freedrive_active[side] = active
+        self.append_log(f"[gui] {SIDES[side]} freedrive={'ON' if active else 'OFF'}: {message}")
+        self.update_freedrive_button()
+
+    def update_freedrive_button(self):
+        if not hasattr(self, "freedrive_button"):
+            return
+        selected = self.selected_sides()
+        selected_active = [self.freedrive_active.get(side, False) for side in selected]
+        if selected and all(selected_active):
+            self.freedrive_button.setText("Freedrive ON")
+            self.freedrive_button.setStyleSheet(
+                "QPushButton { background: #d69e2e; color: black; font-weight: bold; }"
+            )
+        elif any(self.freedrive_active.values()):
+            active = ",".join(
+                SIDES[side] for side, value in self.freedrive_active.items() if value
+            )
+            self.freedrive_button.setText(f"Freedrive {active}")
+            self.freedrive_button.setStyleSheet(
+                "QPushButton { background: #faf089; color: black; font-weight: bold; }"
+            )
+        else:
+            self.freedrive_button.setText("Freedrive")
+            self.freedrive_button.setStyleSheet("")
 
     def append_log(self, text):
         self.terminal.appendPlainText(text.rstrip())
@@ -470,6 +736,11 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             "auto_switch_moveit_controllers:=true",
             "launch_moveit_rviz:=false",
         ]
+        if self.opt_zero_admittance.isChecked():
+            args.extend([
+                "integrated_controller_admittance:=0.0 0.0 0.0 0.0 0.0 0.0",
+                "integrated_controller_wrench_twist_gain:=0.0 0.0 0.0 0.0 0.0 0.0",
+            ])
         if self.opt_integrated.isChecked():
             args.extend([
                 "launch_arm_velocity_safety:=false",
@@ -574,6 +845,120 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         dialog.activateWindow()
         self._jog_dialog = dialog
 
+    def toggle_freedrive(self):
+        sides = self.selected_sides()
+        if not sides:
+            self.append_log("[gui] Refusing freedrive: no arm selected")
+            return
+        enable = not all(self.freedrive_active.get(side, False) for side in sides)
+        fallback = self.fallback_motion_controller()
+        if enable:
+            self.append_log(
+                "[gui] Enabling freedrive: stopping demos, object twists, and motion gates first"
+            )
+            self.stop_demo()
+            self.ros_worker.publish_object_twist([0.0] * 6)
+            for side in sides:
+                service = f"/{self.robot_name()}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
+                self.ros_worker.call_trigger(service, f"disarm before freedrive {SIDES[side]}")
+                self.ros_worker.switch_freedrive(self.robot_name(), side, True, fallback)
+            return
+
+        self.append_log("[gui] Disabling freedrive and restoring previous motion controllers")
+        for side in sides:
+            self.ros_worker.switch_freedrive(self.robot_name(), side, False, fallback)
+
+    def open_demos(self):
+        dialog = DemoDialog(self, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._demo_dialog = dialog
+
+    def start_demo(
+        self,
+        demo_name,
+        xy_amplitude,
+        z_lift,
+        yaw_amplitude_deg,
+        linear_velocity,
+        angular_velocity,
+        repetitions,
+    ):
+        sides = self.selected_sides()
+        if not sides:
+            self.append_log("[gui] Refusing demo: no arm selected")
+            return
+        blocked = []
+        for side in sides:
+            status = self.arm_status.get(side, "unknown")
+            if status != "armed":
+                blocked.append(f"{SIDES[side]}={status}")
+        if blocked:
+            self.append_log(
+                "[gui] Refusing demo: press START MOTION first; " + ", ".join(blocked)
+            )
+            return
+        process = self.processes.get("demo")
+        if process is not None and process.state() != QtCore.QProcess.NotRunning:
+            self.append_log("[gui] demo already running")
+            return
+        robot = self.robot_name()
+        cmd = (
+            setup_prefix()
+            + "exec ros2 run match_cooperative_handling virtual_object_demo_runner.py --ros-args "
+            + f"-p robot_name:={robot} "
+            + f"-p world_frame:={robot}/base_link "
+            + f"-p demo_name:={demo_name} "
+            + f"-p xy_amplitude:={xy_amplitude:.4f} "
+            + f"-p z_lift:={z_lift:.4f} "
+            + f"-p yaw_amplitude_deg:={yaw_amplitude_deg:.3f} "
+            + f"-p linear_velocity:={linear_velocity:.4f} "
+            + f"-p angular_velocity:={angular_velocity:.4f} "
+            + f"-p repetitions:={int(repetitions)}"
+        )
+        self.append_log(
+            "[gui] Starting demo. The demo only publishes virtual object twist commands."
+        )
+        self.start_process("demo", cmd)
+
+    def stop_demo(self):
+        process = self.processes.get("demo")
+        if process is not None and process.state() != QtCore.QProcess.NotRunning:
+            self.append_log("[gui] stopping demo")
+            process.terminate()
+            if not process.waitForFinished(1000):
+                process.kill()
+        self.ros_worker.publish_object_twist([0.0] * 6)
+
+    def start_tracking_log(self):
+        sides = self.selected_sides()
+        if not sides:
+            self.append_log("[gui] Refusing tracking log: no arm selected")
+            return
+        robot = self.robot_name()
+        arms = ",".join(sides)
+        output_dir = os.path.join(WS, "src", "match_cooperative_handling", "logs", "tracking")
+        cmd = (
+            setup_prefix()
+            + "exec ros2 run match_cooperative_handling log_cooperative_tracking.py --ros-args "
+            + f"-p robot_name:={robot} "
+            + f"-p arms:={arms} "
+            + "-p duration:=300.0 "
+            + "-p sample_rate_hz:=50.0 "
+            + f"-p output_dir:={shlex.quote(output_dir)}"
+        )
+        self.append_log(f"[gui] Starting cooperative tracking logger for: {arms}")
+        self.start_process("tracking_log", cmd)
+
+    def stop_tracking_log(self):
+        process = self.processes.get("tracking_log")
+        if process is not None and process.state() != QtCore.QProcess.NotRunning:
+            self.append_log("[gui] stopping tracking logger")
+            process.terminate()
+            if not process.waitForFinished(1000):
+                process.kill()
+
     def open_rviz(self):
         robot = self.robot_name()
         config_path = (
@@ -596,6 +981,11 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
 
     def move_home(self, side):
         prefix = SIDES[side]
+        if self.freedrive_active.get(side, False):
+            self.append_log(f"[gui] Home {prefix}: disabling freedrive first")
+            self.ros_worker.switch_freedrive(
+                self.robot_name(), side, False, self.fallback_motion_controller()
+            )
         if not self.opt_moveit.isChecked():
             self.append_log(
                 f"[gui] Home {prefix}: Launch MoveIt is disabled. "
@@ -630,6 +1020,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         if not sides:
             self.append_log("[gui] Refusing start: no arm selected")
             return
+        freedrive = [SIDES[side] for side in sides if self.freedrive_active.get(side, False)]
+        if freedrive:
+            self.append_log(
+                "[gui] Refusing start: disable freedrive first for " + ", ".join(freedrive)
+            )
+            return
         blocked = []
         for side in sides:
             status = self.arm_status.get(side, "unknown")
@@ -643,12 +1039,14 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self.ros_worker.call_trigger(service, f"start {SIDES[side]}")
 
     def stop_motion(self):
+        self.stop_demo()
         self.ros_worker.publish_object_twist([0.0] * 6)
         for side in self.selected_sides() or ["r", "l"]:
             service = f"/{self.robot_name()}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
             self.ros_worker.call_trigger(service, f"stop {SIDES[side]}")
 
     def stop_managed_processes(self):
+        self.stop_tracking_log()
         for name, process in list(self.processes.items()):
             if process.state() == QtCore.QProcess.NotRunning:
                 continue
@@ -658,6 +1056,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 process.kill()
 
     def closeEvent(self, event):
+        self.stop_demo()
         self.stop_motion()
         self.stop_managed_processes()
         self.ros_worker.shutdown()
