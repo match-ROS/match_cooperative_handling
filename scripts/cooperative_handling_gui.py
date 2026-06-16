@@ -25,14 +25,23 @@ from std_srvs.srv import Trigger
 
 
 WS = os.environ.get("WS", "/home/rosmatch/colcon_ws")
+REMOTE_WS_DEFAULT = os.environ.get("REMOTE_WS", "/home/rosmatch/colcon_ws")
 HARDWARE_SCRIPT = os.path.join(
     WS, "src", "match_mobile_robotics_jazzy", "start_mur620_hardware_logged.sh"
 )
 HARDWARE_LATEST_LOG = os.path.join(
     WS, "src", "match_mobile_robotics_jazzy", "logs", "hardware", "latest.log"
 )
+REMOTE_HOST_SETUP_REL = os.path.join(
+    "src", "match_mobile_robotics_jazzy", "setup_mur_hardware_host.sh"
+)
+REMOTE_HOST_DIAG_REL = os.path.join(
+    "src", "match_mobile_robotics_jazzy", "diagnose_mur_hardware_host.sh"
+)
 PACKAGE = "match_cooperative_handling"
+ROBOTS = ["mur620a", "mur620b", "mur620c", "mur620d"]
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
+WORLD_FRAME = "map"
 FREEDRIVE_CONTROLLER = "freedrive_mode_controller"
 FREEDRIVE_ENABLE_WAIT_SEC = 3.0
 FREEDRIVE_ACTIVE_TRANSITION_WAIT_SEC = 4.0
@@ -54,10 +63,10 @@ MOTION_CONTROLLERS = [
 ]
 
 
-def setup_prefix():
+def setup_prefix(ws=WS):
     return (
         "source /opt/ros/jazzy/setup.bash && "
-        f"source {shlex.quote(os.path.join(WS, 'install', 'setup.bash'))} && "
+        f"source {shlex.quote(os.path.join(ws, 'install', 'setup.bash'))} && "
         f"export ROS_DOMAIN_ID={shlex.quote(os.environ.get('ROS_DOMAIN_ID', '62'))} && "
         "export ROS2CLI_NO_DAEMON=1 && "
         "export PYTHONUNBUFFERED=1 && "
@@ -67,12 +76,12 @@ def setup_prefix():
 
 class RosWorker(QtCore.QThread):
     log = QtCore.pyqtSignal(str)
-    status = QtCore.pyqtSignal(str, str)
-    freedrive_status = QtCore.pyqtSignal(str, bool, str)
+    status = QtCore.pyqtSignal(str, str, str)
+    freedrive_status = QtCore.pyqtSignal(str, str, bool, str)
 
-    def __init__(self, robot_name="mur620d"):
+    def __init__(self, robot_names=None):
         super().__init__()
-        self.robot_name = robot_name
+        self.robot_names = list(robot_names or ["mur620d"])
         self._node = None
         self._object_twist_pub = None
         self._tracking_stop_pub = None
@@ -94,7 +103,7 @@ class RosWorker(QtCore.QThread):
         self._tracking_stop_pub = self._node.create_publisher(
             Bool, "/cooperative_tracking_logger/stop", 10
         )
-        self._configure_status_subscriptions(self.robot_name)
+        self._configure_status_subscriptions(self.robot_names)
         self._ready.set()
         self.log.emit("[ros] GUI ROS helper started")
         while rclpy.ok() and not self._stop.is_set():
@@ -108,30 +117,31 @@ class RosWorker(QtCore.QThread):
     def shutdown(self):
         self._stop.set()
 
-    def set_robot_name(self, robot_name):
-        self.robot_name = robot_name
+    def set_robot_names(self, robot_names):
+        self.robot_names = list(robot_names or ["mur620d"])
         if self._ready.wait(timeout=1.0):
-            self._configure_status_subscriptions(robot_name)
+            self._configure_status_subscriptions(self.robot_names)
 
-    def _configure_status_subscriptions(self, robot_name):
+    def _configure_status_subscriptions(self, robot_names):
         with self._lock:
             if self._node is None:
                 return
             for sub in self._status_subs:
                 self._node.destroy_subscription(sub)
             self._status_subs = []
-            for side, prefix in SIDES.items():
-                topic = f"/{robot_name}/{prefix}/virtual_object_tcp_transform_node/status"
-                sub = self._node.create_subscription(
-                    String,
-                    topic,
-                    partial(self._on_status, side),
-                    10,
-                )
-                self._status_subs.append(sub)
+            for robot_name in robot_names:
+                for side, prefix in SIDES.items():
+                    topic = f"/{robot_name}/{prefix}/virtual_object_tcp_transform_node/status"
+                    sub = self._node.create_subscription(
+                        String,
+                        topic,
+                        partial(self._on_status, robot_name, side),
+                        10,
+                    )
+                    self._status_subs.append(sub)
 
-    def _on_status(self, side, msg):
-        self.status.emit(side, msg.data)
+    def _on_status(self, robot_name, side, msg):
+        self.status.emit(robot_name, side, msg.data)
 
     def call_trigger(self, service_name, label):
         if not self._ready.wait(timeout=1.0):
@@ -400,7 +410,7 @@ class RosWorker(QtCore.QThread):
             states, error = self._ensure_controller_loaded(controller_manager, FREEDRIVE_CONTROLLER)
             if states is None:
                 self.log.emit(f"[ros] Freedrive {SIDES[side]}: {error}")
-                self.freedrive_status.emit(side, False, error)
+                self.freedrive_status.emit(robot_name, side, False, error)
                 return
             active_motion = [
                 name
@@ -458,7 +468,7 @@ class RosWorker(QtCore.QThread):
             finally:
                 destroy_transition_sub()
             self.log.emit(f"[ros] {message}")
-            self.freedrive_status.emit(side, ok, message)
+            self.freedrive_status.emit(robot_name, side, ok, message)
             return
 
         restore = self._previous_freedrive_controllers.get(key) or [fallback_controller]
@@ -475,14 +485,14 @@ class RosWorker(QtCore.QThread):
         if publish_ok:
             message += "; enable_freedrive_mode=false sent"
         self.log.emit(f"[ros] {message}")
-        self.freedrive_status.emit(side, False if ok else True, message)
+        self.freedrive_status.emit(robot_name, side, False if ok else True, message)
 
     def publish_object_twist(self, values):
         if self._object_twist_pub is None:
             return
         msg = TwistStamped()
         msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.header.frame_id = f"{self.robot_name}/base_link"
+        msg.header.frame_id = WORLD_FRAME
         msg.twist.linear.x = float(values[0])
         msg.twist.linear.y = float(values[1])
         msg.twist.linear.z = float(values[2])
@@ -720,12 +730,15 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.setWindowTitle("MuR Cooperative Handling")
         self.resize(1180, 780)
         self.processes = {}
-        self.arm_status = {"r": "unknown", "l": "unknown"}
-        self.ur_reverse_ready = {"r": False, "l": False}
-        self.ur_ready_log_scan_start = None
-        self.freedrive_active = {"r": False, "l": False}
+        self.arm_status = {}
+        self.ur_reverse_ready = {}
+        self.ur_ready_log_scan_start = {}
+        self.freedrive_active = {}
+        self.connected_robots = set()
+        self.connect_status = {}
+        self.connect_messages = {}
 
-        self.ros_worker = RosWorker("mur620")
+        self.ros_worker = RosWorker(["mur620d"])
         self.ros_worker.log.connect(self.append_log)
         self.ros_worker.status.connect(self.update_arm_status)
         self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
@@ -744,6 +757,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         actions = QtWidgets.QHBoxLayout()
         root.addLayout(actions)
         for button in (
+            self._button("Connect", self.connect_selected_robots),
+            self._button("Check Host", self.check_selected_hosts),
             self._button("Start Hardware", self.start_hardware),
             self._button("Enable URs / Ready", self.ensure_ur_ready),
             self._button("Start Object Nodes", self.start_object_nodes),
@@ -755,6 +770,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self._button("Stop Managed Processes", self.stop_managed_processes),
         ):
             actions.addWidget(button)
+            if button.text() == "Connect":
+                self.connect_button = button
+                self.update_connect_button()
             if button.text() == "Freedrive":
                 self.freedrive_button = button
                 self.update_freedrive_button()
@@ -804,13 +822,22 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def _build_robot_box(self):
         box = QtWidgets.QGroupBox("Robot")
         layout = QtWidgets.QFormLayout(box)
-        self.robot_combo = QtWidgets.QComboBox()
-        self.robot_combo.addItems(["mur620a", "mur620b", "mur620c", "mur620d"])
-        self.robot_combo.setCurrentText("mur620d")
-        layout.addRow("Profile", self.robot_combo)
-        self.ros_name_edit = QtWidgets.QLineEdit("mur620")
-        self.ros_name_edit.editingFinished.connect(self.on_ros_name_changed)
-        layout.addRow("ROS name", self.ros_name_edit)
+        robot_checks = QtWidgets.QWidget()
+        robot_layout = QtWidgets.QVBoxLayout(robot_checks)
+        robot_layout.setContentsMargins(0, 0, 0, 0)
+        self.robot_checks = {}
+        for robot in ROBOTS:
+            check = QtWidgets.QCheckBox(robot)
+            check.setChecked(robot == "mur620d")
+            check.toggled.connect(lambda _checked: self.on_robot_selection_changed())
+            self.robot_checks[robot] = check
+            robot_layout.addWidget(check)
+        layout.addRow("MuRs", robot_checks)
+        self.opt_sync_code = QtWidgets.QCheckBox("Sync Code")
+        self.opt_sync_code.setChecked(True)
+        layout.addRow(self.opt_sync_code)
+        self.remote_ws_edit = QtWidgets.QLineEdit(REMOTE_WS_DEFAULT)
+        layout.addRow("Remote WS", self.remote_ws_edit)
         self.arm_r = QtWidgets.QCheckBox("UR10_r")
         self.arm_r.setChecked(True)
         self.arm_r.toggled.connect(lambda _checked: self.update_freedrive_button())
@@ -867,10 +894,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def _build_status_box(self):
         box = QtWidgets.QGroupBox("Motion Gate")
         layout = QtWidgets.QFormLayout(box)
-        self.status_r = QtWidgets.QLabel("unknown")
-        self.status_l = QtWidgets.QLabel("unknown")
-        layout.addRow("UR10_r", self.status_r)
-        layout.addRow("UR10_l", self.status_l)
+        self.status_labels = {}
+        for robot in ROBOTS:
+            for side, prefix in SIDES.items():
+                label = QtWidgets.QLabel("unknown | UR reverse missing")
+                self.status_labels[(robot, side)] = label
+                layout.addRow(f"{robot}/{prefix}", label)
         return box
 
     def _check(self, text, checked):
@@ -889,11 +918,60 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def moveit_velocity_scaling(self):
         return max(1, min(100, self.moveit_speed_slider.value())) / 100.0
 
-    def robot_profile(self):
-        return self.robot_combo.currentText()
+    def remote_ws(self):
+        return self.remote_ws_edit.text().strip() or REMOTE_WS_DEFAULT
+
+    def selected_robots(self):
+        robots = [
+            robot for robot in ROBOTS
+            if self.robot_checks.get(robot) is not None and self.robot_checks[robot].isChecked()
+        ]
+        return robots or ["mur620d"]
+
+    def object_host(self):
+        selected = self.selected_robots()
+        for robot in ROBOTS:
+            if robot in selected:
+                return robot
+        return selected[0]
+
+    def robot_profile(self, robot=None):
+        return robot or self.object_host()
 
     def robot_name(self):
-        return self.ros_name_edit.text().strip() or "mur620"
+        return self.object_host()
+
+    def robot_arm_pairs(self, robots=None, sides=None):
+        robots = list(robots or self.selected_robots())
+        sides = list(sides or self.selected_sides())
+        return [(robot, side) for robot in robots for side in sides]
+
+    def process_key(self, robot, name):
+        return f"{robot}:{name}"
+
+    def remote_setup_prefix(self):
+        return setup_prefix(self.remote_ws())
+
+    def remote_command(self, robot, command):
+        remote_shell = "bash -lc " + shlex.quote(command)
+        return f"ssh -o BatchMode=yes {shlex.quote(robot)} {shlex.quote(remote_shell)}"
+
+    def remote_ros_command(self, robot, command):
+        return self.remote_command(robot, self.remote_setup_prefix() + command)
+
+    def remote_hardware_script(self):
+        return os.path.join(
+            self.remote_ws(),
+            "src",
+            "match_mobile_robotics_jazzy",
+            "start_mur620_hardware_logged.sh",
+        )
+
+    def remote_host_setup_script(self):
+        return os.path.join(self.remote_ws(), REMOTE_HOST_SETUP_REL)
+
+    def remote_host_diag_script(self):
+        return os.path.join(self.remote_ws(), REMOTE_HOST_DIAG_REL)
 
     def selected_sides(self):
         sides = []
@@ -908,45 +986,92 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             return "integrated_cartesian_admittance_controller"
         return "forward_velocity_controller"
 
-    def on_ros_name_changed(self):
-        self.ros_worker.set_robot_name(self.robot_name())
-        self.arm_status = {"r": "unknown", "l": "unknown"}
-        self.ur_reverse_ready = {"r": False, "l": False}
+    def on_robot_selection_changed(self):
+        self.ros_worker.set_robot_names(self.selected_robots())
+        for robot in ROBOTS:
+            for side in SIDES:
+                self.arm_status[(robot, side)] = "unknown"
+                self.ur_reverse_ready[(robot, side)] = False
         self.refresh_status_labels()
+        self.update_connect_button()
+        self.update_freedrive_button()
 
-    def update_arm_status(self, side, status):
-        self.arm_status[side] = status
-        self.refresh_status_label(side)
+    def update_arm_status(self, robot, side, status):
+        self.arm_status[(robot, side)] = status
+        self.refresh_status_label(robot, side)
 
-    def set_ur_reverse_ready(self, side, ready, reason):
-        if self.ur_reverse_ready.get(side) == ready:
+    def set_ur_reverse_ready(self, robot, side, ready, reason):
+        key = (robot, side)
+        if self.ur_reverse_ready.get(key) == ready:
             return
-        self.ur_reverse_ready[side] = ready
+        self.ur_reverse_ready[key] = ready
         state = "ready" if ready else "not ready"
-        self.append_log(f"[gui] {SIDES[side]} UR reverse interface {state}: {reason}")
-        self.refresh_status_label(side)
+        self.append_log(f"[gui] {robot}/{SIDES[side]} UR reverse interface {state}: {reason}")
+        self.refresh_status_label(robot, side)
 
-    def refresh_status_label(self, side):
-        gate_status = self.arm_status.get(side, "unknown")
-        reverse_status = "UR reverse OK" if self.ur_reverse_ready.get(side, False) else "UR reverse missing"
-        (self.status_r if side == "r" else self.status_l).setText(
-            f"{gate_status} | {reverse_status}"
+    def refresh_status_label(self, robot, side):
+        gate_status = self.arm_status.get((robot, side), "unknown")
+        reverse_status = (
+            "UR reverse OK" if self.ur_reverse_ready.get((robot, side), False)
+            else "UR reverse missing"
         )
+        label = self.status_labels.get((robot, side))
+        if label is not None:
+            label.setText(f"{gate_status} | {reverse_status}")
 
     def refresh_status_labels(self):
-        for side in SIDES:
-            self.refresh_status_label(side)
+        for robot in ROBOTS:
+            for side in SIDES:
+                self.refresh_status_label(robot, side)
 
-    def update_freedrive_status(self, side, active, message):
-        self.freedrive_active[side] = active
-        self.append_log(f"[gui] {SIDES[side]} freedrive={'ON' if active else 'OFF'}: {message}")
+    def update_freedrive_status(self, robot, side, active, message):
+        self.freedrive_active[(robot, side)] = active
+        self.append_log(
+            f"[gui] {robot}/{SIDES[side]} freedrive={'ON' if active else 'OFF'}: {message}"
+        )
         self.update_freedrive_button()
+
+    def update_connect_button(self):
+        if not hasattr(self, "connect_button"):
+            return
+        selected = self.selected_robots()
+        states = [self.connect_status.get(robot, "idle") for robot in selected]
+        details = []
+        for robot in selected:
+            state = self.connect_status.get(robot, "idle")
+            message = self.connect_messages.get(robot, "not connected")
+            details.append(f"{robot}: {state} - {message}")
+        self.connect_button.setToolTip("\n".join(details))
+
+        if any(state == "running" for state in states):
+            self.connect_button.setText("Connect...")
+            self.connect_button.setStyleSheet(
+                "QPushButton { background: #d69e2e; color: black; font-weight: bold; }"
+            )
+        elif selected and all(state == "ok" for state in states):
+            self.connect_button.setText("Connected")
+            self.connect_button.setStyleSheet(
+                "QPushButton { background: #1f9d55; color: white; font-weight: bold; }"
+            )
+        elif any(state == "warn" for state in states):
+            self.connect_button.setText("Check Host")
+            self.connect_button.setStyleSheet(
+                "QPushButton { background: #d69e2e; color: black; font-weight: bold; }"
+            )
+        elif any(state == "failed" for state in states):
+            self.connect_button.setText("Connect Failed")
+            self.connect_button.setStyleSheet(
+                "QPushButton { background: #c53030; color: white; font-weight: bold; }"
+            )
+        else:
+            self.connect_button.setText("Connect")
+            self.connect_button.setStyleSheet("")
 
     def update_freedrive_button(self):
         if not hasattr(self, "freedrive_button"):
             return
-        selected = self.selected_sides()
-        selected_active = [self.freedrive_active.get(side, False) for side in selected]
+        selected = self.robot_arm_pairs()
+        selected_active = [self.freedrive_active.get(pair, False) for pair in selected]
         if selected and all(selected_active):
             self.freedrive_button.setText("Freedrive ON")
             self.freedrive_button.setStyleSheet(
@@ -954,7 +1079,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             )
         elif any(self.freedrive_active.values()):
             active = ",".join(
-                SIDES[side] for side, value in self.freedrive_active.items() if value
+                f"{robot}/{SIDES[side]}"
+                for (robot, side), value in self.freedrive_active.items()
+                if value
             )
             self.freedrive_button.setText(f"Freedrive {active}")
             self.freedrive_button.setStyleSheet(
@@ -997,20 +1124,21 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         data = bytes(process.readAllStandardOutput()).decode(errors="replace")
         for line in data.splitlines():
             self.append_log(f"[{tag}] {line}")
-            if tag == "hardware":
-                self._observe_hardware_line(line)
+            if tag == "hardware" or tag.endswith(":hardware"):
+                robot = tag.split(":", 1)[0] if ":" in tag else self.object_host()
+                self._observe_hardware_line(robot, line)
 
-    def _observe_hardware_line(self, line):
+    def _observe_hardware_line(self, robot, line):
         if UR_REVERSE_READY_TEXT in line:
             for side, prefix in SIDES.items():
                 if prefix in line:
-                    self.set_ur_reverse_ready(side, True, "reverse interface connected")
+                    self.set_ur_reverse_ready(robot, side, True, "reverse interface connected")
             return
 
         if "UR SetMode goal was rejected" in line:
             for side, prefix in SIDES.items():
                 if prefix in line:
-                    self.set_ur_reverse_ready(side, False, "SetMode goal rejected")
+                    self.set_ur_reverse_ready(robot, side, False, "SetMode goal rejected")
 
     def _hardware_log_size(self):
         try:
@@ -1038,18 +1166,156 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             for side in sides:
                 if SIDES[side] in line:
                     self.set_ur_reverse_ready(
-                        side, True, f"reverse interface seen in {HARDWARE_LATEST_LOG}"
+                        self.object_host(),
+                        side,
+                        True,
+                        f"reverse interface seen in {HARDWARE_LATEST_LOG}",
                     )
+
+    def connect_selected_robots(self):
+        robots = self.selected_robots()
+        for robot in robots:
+            self.connect_status[robot] = "running"
+            self.connect_messages[robot] = (
+                "ssh check and rsync running"
+                if self.opt_sync_code.isChecked()
+                else "ssh check running"
+            )
+            self.update_connect_button()
+            mkdir_cmd = (
+                f"mkdir -p {shlex.quote(os.path.join(self.remote_ws(), 'src'))} && "
+                "echo connected"
+            )
+            if self.opt_sync_code.isChecked():
+                excludes = [
+                    "--exclude=build/",
+                    "--exclude=install/",
+                    "--exclude=log/",
+                    "--exclude=logs/",
+                    "--exclude=__pycache__/",
+                    "--exclude=.pytest_cache/",
+                    "--exclude=.colcon/",
+                    "--exclude=.git/",
+                ]
+                rsync_cmd = " ".join(
+                    [
+                        "rsync",
+                        "-az",
+                        "--delete",
+                        *excludes,
+                        shlex.quote(os.path.join(WS, "src") + "/"),
+                        shlex.quote(f"{robot}:{os.path.join(self.remote_ws(), 'src') + '/'}"),
+                    ]
+                )
+                command = self.remote_command(robot, mkdir_cmd) + " && " + rsync_cmd
+            else:
+                command = self.remote_command(robot, mkdir_cmd)
+            check_cmd = (
+                f"test -x {shlex.quote(self.remote_host_setup_script())} && "
+                f"{shlex.quote(self.remote_host_setup_script())} --check"
+            )
+            command = command + " && " + self.remote_command(robot, check_cmd)
+
+            def done(exit_code, _status, current_robot=robot):
+                if exit_code == 0:
+                    self.connected_robots.add(current_robot)
+                    self.connect_status[current_robot] = "ok"
+                    if self.opt_sync_code.isChecked():
+                        self.connect_messages[current_robot] = (
+                            f"ssh ok, rsync ok to {self.remote_ws()}/src"
+                        )
+                    else:
+                        self.connect_messages[current_robot] = "ssh ok, sync skipped"
+                else:
+                    self.connected_robots.discard(current_robot)
+                    self.connect_status[current_robot] = "failed"
+                    self.connect_messages[current_robot] = (
+                        f"ssh/rsync/host-check failed with exit code {exit_code}; "
+                        "run Check Host or see terminal log"
+                    )
+                self.update_connect_button()
+
+            self.start_process(
+                self.process_key(robot, "connect"),
+                command,
+                on_finished=done,
+            )
+
+    def check_selected_hosts(self):
+        for robot in self.selected_robots():
+            self.connect_status[robot] = "running"
+            self.connect_messages[robot] = "host preflight check running"
+            self.update_connect_button()
+            command = self.remote_command(
+                robot,
+                f"test -x {shlex.quote(self.remote_host_diag_script())} && "
+                f"{shlex.quote(self.remote_host_diag_script())}",
+            )
+
+            def done(exit_code, _status, current_robot=robot):
+                if exit_code == 0:
+                    self.connected_robots.add(current_robot)
+                    self.connect_status[current_robot] = "ok"
+                    self.connect_messages[current_robot] = "host check ok; details in terminal"
+                else:
+                    self.connected_robots.discard(current_robot)
+                    self.connect_status[current_robot] = "failed"
+                    self.connect_messages[current_robot] = (
+                        f"host check failed with exit code {exit_code}; details in terminal"
+                    )
+                self.update_connect_button()
+
+            self.start_process(
+                self.process_key(robot, "host_check"),
+                command,
+                on_finished=done,
+            )
 
     def start_hardware(self):
         self.stop_demo()
         self.ros_worker.publish_object_twist([0.0] * 6)
         self.stop_object_nodes(start_after_cleanup=False)
-        profile = self.robot_profile()
-        for side in self.selected_sides():
-            self.ur_reverse_ready[side] = False
-            self.refresh_status_label(side)
+        for robot in self.selected_robots():
+            for side in self.selected_sides():
+                self.ur_reverse_ready[(robot, side)] = False
+                self.refresh_status_label(robot, side)
+            self._start_hardware_after_preflight(robot)
+
+    def _start_hardware_after_preflight(self, robot):
+        preflight_cmd = self.remote_command(
+            robot,
+            f"test -x {shlex.quote(self.remote_host_setup_script())} && "
+            f"{shlex.quote(self.remote_host_setup_script())} --check",
+        )
+
+        def done(exit_code, _status, current_robot=robot):
+            if exit_code != 0:
+                self.connect_status[current_robot] = "failed"
+                self.connect_messages[current_robot] = (
+                    f"hardware preflight failed with exit code {exit_code}; "
+                    "run remote setup_mur_hardware_host.sh --apply"
+                )
+                self.update_connect_button()
+                self.append_log(
+                    f"[gui] Refusing Start Hardware for {current_robot}: "
+                    "host preflight failed. Run Connect/Check Host and fix blocking issues."
+                )
+                return
+            self.connect_status[current_robot] = "ok"
+            self.connect_messages[current_robot] = "host preflight ok for hardware start"
+            self.update_connect_button()
+            self._launch_hardware_for_robot(current_robot)
+
+        self.start_process(
+            self.process_key(robot, "hardware_preflight"),
+            preflight_cmd,
+            on_finished=done,
+        )
+
+    def _launch_hardware_for_robot(self, robot):
         args = [
+            f"robot_name:={robot}",
+            f"robot_profile:={robot}",
             f"launch_ur_r:={'true' if self.arm_r.isChecked() else 'false'}",
             f"launch_ur_l:={'true' if self.arm_l.isChecked() else 'false'}",
             f"integrated_controller_enable_collision_avoidance:={'true' if self.opt_collision.isChecked() else 'false'}",
@@ -1068,49 +1334,46 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 "launch_arm_velocity_safety:=false",
                 "launch_jparse_idk:=false",
             ])
-        env = {
-            "ROS_DOMAIN_ID": os.environ.get("ROS_DOMAIN_ID", "62"),
-            "ROBOT_PROFILE": profile,
-            "BUILD_BEFORE_LAUNCH": "true" if self.opt_build.isChecked() else "false",
-            "BUILD_PACKAGES": (
-                "serial ewellix_driver mur_control mur_moveit_config "
-                "mur_launch_hardware match_cooperative_handling"
-            ),
-            "INTEGRATED_CARTESIAN_ACTIVE": "true" if self.opt_integrated.isChecked() else "false",
-            "INTEGRATED_CARTESIAN_USE_FT": "true" if self.opt_ft.isChecked() else "false",
-            "INTEGRATED_CARTESIAN_REQUIRE_WRENCH": (
-                "true" if self.opt_require_wrench.isChecked() else "false"
-            ),
-            "MOVEIT_WITH_INTEGRATED_CARTESIAN": (
-                "true" if self.opt_moveit.isChecked() and self.opt_integrated.isChecked() else "false"
-            ),
-        }
-        command = " ".join([shlex.quote(HARDWARE_SCRIPT)] + [shlex.quote(arg) for arg in args])
-        self.start_process("hardware", command, env)
+        env_prefix = " ".join(
+            [
+                f"export ROS_DOMAIN_ID={shlex.quote(os.environ.get('ROS_DOMAIN_ID', '62'))};",
+                f"export ROBOT_PROFILE={shlex.quote(robot)};",
+                f"export BUILD_BEFORE_LAUNCH={'true' if self.opt_build.isChecked() else 'false'};",
+                "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_cooperative_handling';",
+                f"export INTEGRATED_CARTESIAN_ACTIVE={'true' if self.opt_integrated.isChecked() else 'false'};",
+                f"export INTEGRATED_CARTESIAN_USE_FT={'true' if self.opt_ft.isChecked() else 'false'};",
+                f"export INTEGRATED_CARTESIAN_REQUIRE_WRENCH={'true' if self.opt_require_wrench.isChecked() else 'false'};",
+                f"export MOVEIT_WITH_INTEGRATED_CARTESIAN={'true' if self.opt_moveit.isChecked() and self.opt_integrated.isChecked() else 'false'};",
+                "export MUR_REQUIRE_HOST_PREFLIGHT=true;",
+            ]
+        )
+        launch_cmd = " ".join(
+            [shlex.quote(self.remote_hardware_script())]
+            + [shlex.quote(arg) for arg in args]
+        )
+        command = self.remote_command(robot, env_prefix + " " + launch_cmd)
+        self.start_process(self.process_key(robot, "hardware"), command)
 
-    def ensure_ur_ready(self, sides=None, on_success=None, retry_count=0):
+    def ensure_ur_ready(self, sides=None, robots=None, on_success=None, retry_count=0):
         if isinstance(sides, bool):
             sides = None
+        if isinstance(robots, bool):
+            robots = None
+        selected_robots = list(robots or self.selected_robots())
         selected = list(sides) if sides is not None else self.selected_sides()
         if not selected:
             self.append_log("[gui] Refusing UR ready check: no arm selected")
             return False
+        if not selected_robots:
+            self.append_log("[gui] Refusing UR ready check: no robot selected")
+            return False
         if retry_count == 0:
-            self.ur_ready_log_scan_start = self._hardware_log_size()
-            for side in selected:
-                self.set_ur_reverse_ready(side, False, "manual enable/check requested")
-        robot = self.robot_name()
-        commands = []
-        for side in selected:
-            prefix = SIDES[side]
-            commands.append(
-                "ros2 run match_cooperative_handling ensure_ur_ready.py --ros-args "
-                + f"-p arm_namespace:=/{robot}/{prefix} "
-                + "-p wait_timeout:=30.0 "
-                + "-p target_robot_mode:=7 "
-                + "-p allow_stop_restart:=true"
-            )
-        command = setup_prefix() + " && ".join(commands)
+            for robot in selected_robots:
+                self.ur_ready_log_scan_start[robot] = None
+                for side in selected:
+                    self.set_ur_reverse_ready(
+                        robot, side, False, "manual enable/check requested"
+                    )
 
         def retry(reason):
             if retry_count >= UR_READY_RETRY_LIMIT:
@@ -1127,42 +1390,64 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 1500,
                 lambda: self.ensure_ur_ready(
                     sides=selected,
+                    robots=selected_robots,
                     on_success=on_success,
                     retry_count=retry_count + 1,
                 ),
             )
 
-        def done(exit_code, _status):
-            if exit_code == 0:
-                self._wait_for_ur_reverse_ready(
-                    selected,
-                    on_success=on_success,
-                    on_timeout=lambda missing: retry(
-                        "missing reverse interface for "
-                        + ", ".join(SIDES[side] for side in missing)
-                    ),
-                )
-            else:
-                retry("ensure_ur_ready script exited with failure")
-
         self.append_log(
             "[gui] Ensuring selected URs are running their External Control program: "
-            + ", ".join(SIDES[side] for side in selected)
+            + ", ".join(f"{robot}/{SIDES[side]}" for robot in selected_robots for side in selected)
         )
-        self.start_process("ensure_ur_ready", command, on_finished=done)
+        remaining = set(selected_robots)
+
+        def robot_ready(robot):
+            remaining.discard(robot)
+            if not remaining and on_success is not None:
+                QtCore.QTimer.singleShot(200, on_success)
+
+        for robot in selected_robots:
+            commands = []
+            for side in selected:
+                prefix = SIDES[side]
+                commands.append(
+                    "ros2 run match_cooperative_handling ensure_ur_ready.py --ros-args "
+                    + f"-p arm_namespace:=/{robot}/{prefix} "
+                    + "-p wait_timeout:=30.0 "
+                    + "-p target_robot_mode:=7 "
+                    + "-p allow_stop_restart:=true"
+                )
+            command = self.remote_ros_command(robot, " && ".join(commands))
+
+            def done(exit_code, _status, current_robot=robot):
+                if exit_code == 0:
+                    self._wait_for_ur_reverse_ready(
+                        current_robot,
+                        selected,
+                        on_success=lambda current_robot=current_robot: robot_ready(current_robot),
+                        on_timeout=lambda missing, current_robot=current_robot: retry(
+                            f"{current_robot}: missing reverse interface for "
+                            + ", ".join(SIDES[side] for side in missing)
+                        ),
+                    )
+                else:
+                    retry(f"{current_robot}: ensure_ur_ready script exited with failure")
+
+            self.start_process(self.process_key(robot, "ensure_ur_ready"), command, on_finished=done)
         return True
 
-    def _wait_for_ur_reverse_ready(self, sides, on_success=None, on_timeout=None):
+    def _wait_for_ur_reverse_ready(self, robot, sides, on_success=None, on_timeout=None):
         deadline = time.monotonic() + UR_REVERSE_WAIT_SEC
 
         def poll():
-            self._scan_latest_hardware_log_for_reverse_ready(
-                sides, since_offset=self.ur_ready_log_scan_start
-            )
-            missing = [side for side in sides if not self.ur_reverse_ready.get(side, False)]
+            missing = [
+                side for side in sides
+                if not self.ur_reverse_ready.get((robot, side), False)
+            ]
             if not missing:
                 self.append_log(
-                    "[gui] UR reverse interface ready for: "
+                    f"[gui] {robot} UR reverse interface ready for: "
                     + ", ".join(SIDES[side] for side in sides)
                 )
                 if on_success is not None:
@@ -1193,7 +1478,15 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             if not cleanup_process.waitForFinished(1000):
                 cleanup_process.kill()
 
-        for name in ("object_state", "object_transform_r", "object_transform_l"):
+        managed_names = ["map_tf", "object_state"]
+        for robot in ROBOTS:
+            managed_names.extend([
+                self.process_key(robot, "map_tf"),
+                self.process_key(robot, "object_state"),
+            ])
+            for side in SIDES:
+                managed_names.append(self.process_key(robot, f"object_transform_{side}"))
+        for name in managed_names:
             process = self.processes.get(name)
             if process is not None and process.state() != QtCore.QProcess.NotRunning:
                 self.append_log(f"[gui] terminating {name}")
@@ -1217,6 +1510,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             for pattern in cleanup_patterns
         )
 
+        remote_cleanup = []
+        for robot in self.selected_robots():
+            remote_cleanup.append(self.remote_command(robot, cleanup_cmd))
+        if remote_cleanup:
+            cleanup_cmd = " ; ".join(remote_cleanup)
+
         if start_after_cleanup:
             self.append_log("[gui] Restarting virtual object nodes with a clean slate")
             self.start_process(
@@ -1229,78 +1528,105 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self.start_process("object_cleanup", cleanup_cmd)
 
     def _start_object_nodes_after_cleanup(self):
-        robot = self.robot_name()
+        object_host = self.object_host()
+        map_cmd = (
+            self.remote_setup_prefix()
+            + f"exec ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "
+            + f"{WORLD_FRAME} {object_host}/base_link"
+        )
+        self.start_process(
+            self.process_key(object_host, "map_tf"),
+            self.remote_command(object_host, map_cmd),
+        )
         state_cmd = (
-            setup_prefix()
+            self.remote_setup_prefix()
             + "exec ros2 run match_cooperative_handling virtual_object_state_node --ros-args "
-            + f"-p world_frame:={robot}/base_link "
+            + f"-p world_frame:={WORLD_FRAME} "
             + "-p rate:=500.0"
         )
-        self.start_process("object_state", state_cmd)
-        for side in self.selected_sides():
-            prefix = SIDES[side]
-            transform_cmd = (
-                setup_prefix()
-                + "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
-                + f"-r __ns:=/{robot}/{prefix} "
-                + f"-p robot_name:={robot} "
-                + f"-p arm:={side} "
-                + "-p rate:=500.0"
-            )
-            self.start_process(f"object_transform_{side}", transform_cmd)
+        self.start_process(
+            self.process_key(object_host, "object_state"),
+            self.remote_command(object_host, state_cmd),
+        )
+        for robot in self.selected_robots():
+            for side in self.selected_sides():
+                prefix = SIDES[side]
+                transform_cmd = (
+                    self.remote_setup_prefix()
+                    + "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
+                    + f"-r __ns:=/{robot}/{prefix} "
+                    + f"-p robot_name:={robot} "
+                    + f"-p arm:={side} "
+                    + f"-p world_frame:={WORLD_FRAME} "
+                    + "-p rate:=500.0"
+                )
+                self.start_process(
+                    self.process_key(robot, f"object_transform_{side}"),
+                    self.remote_command(robot, transform_cmd),
+                )
 
     def set_from_tcp(self):
         side = "r" if self.arm_r.isChecked() else "l"
-        robot = self.robot_name()
+        robot = self.object_host()
         cmd = (
-            setup_prefix()
+            self.remote_setup_prefix()
             + "exec ros2 run match_cooperative_handling set_virtual_object_from_tcp.py --ros-args "
             + f"-p robot_name:={robot} "
-            + f"-p arm:={side}"
+            + f"-p arm:={side} "
+            + f"-p world_frame:={WORLD_FRAME}"
         )
-        self.start_process(f"set_from_tcp_{side}", cmd)
+        self.start_process(
+            self.process_key(robot, f"set_from_tcp_{side}"),
+            self.remote_command(robot, cmd),
+        )
 
     def set_object_center(self):
         sides = self.selected_sides()
         if len(sides) < 2:
             self.append_log("[gui] Refusing object center: select at least two manipulators")
             return
-        robot = self.robot_name()
+        robot = self.object_host()
         arms = ",".join(sides)
         cmd = (
-            setup_prefix()
+            self.remote_setup_prefix()
             + "exec ros2 run match_cooperative_handling "
             + "set_virtual_object_from_manipulators.py --ros-args "
             + f"-p robot_name:={robot} "
             + f"-p arms:={arms} "
-            + f"-p world_frame:={robot}/base_link"
+            + f"-p world_frame:={WORLD_FRAME}"
         )
         self.append_log(
-            f"[gui] Setting virtual object center from selected manipulators: {arms}"
+            f"[gui] Setting virtual object center on {robot} from selected manipulators: {arms}"
         )
-        self.start_process("set_object_center", cmd)
+        self.start_process(
+            self.process_key(robot, "set_object_center"),
+            self.remote_command(robot, cmd),
+        )
 
     def set_current_offsets(self):
         sides = self.selected_sides()
         if not sides:
             self.append_log("[gui] Refusing current offsets: select at least one manipulator")
             return
-        robot = self.robot_name()
         arms = ",".join(sides)
-        cmd = (
-            setup_prefix()
-            + "exec ros2 run match_cooperative_handling "
-            + "set_relative_pose_from_current_object.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p arms:={arms} "
-            + f"-p world_frame:={robot}/base_link "
-            + "-p object_frame:=virtual_object/base_link "
-            + "-p max_distance:=2.0"
-        )
-        self.append_log(
-            f"[gui] Setting current object-relative TCP offsets for: {arms}"
-        )
-        self.start_process("set_current_offsets", cmd)
+        for robot in self.selected_robots():
+            cmd = (
+                self.remote_setup_prefix()
+                + "exec ros2 run match_cooperative_handling "
+                + "set_relative_pose_from_current_object.py --ros-args "
+                + f"-p robot_name:={robot} "
+                + f"-p arms:={arms} "
+                + f"-p world_frame:={WORLD_FRAME} "
+                + "-p object_frame:=virtual_object/base_link "
+                + "-p max_distance:=2.0"
+            )
+            self.append_log(
+                f"[gui] Setting current object-relative TCP offsets for {robot}: {arms}"
+            )
+            self.start_process(
+                self.process_key(robot, "set_current_offsets"),
+                self.remote_command(robot, cmd),
+            )
 
     def open_object_jog(self):
         dialog = ObjectJogDialog(self.ros_worker, self)
@@ -1310,11 +1636,11 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self._jog_dialog = dialog
 
     def toggle_freedrive(self):
-        sides = self.selected_sides()
-        if not sides:
+        pairs = self.robot_arm_pairs()
+        if not pairs:
             self.append_log("[gui] Refusing freedrive: no arm selected")
             return
-        enable = not all(self.freedrive_active.get(side, False) for side in sides)
+        enable = not all(self.freedrive_active.get(pair, False) for pair in pairs)
         fallback = self.fallback_motion_controller()
         if enable:
             self.append_log(
@@ -1322,15 +1648,17 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             )
             self.stop_demo()
             self.ros_worker.publish_object_twist([0.0] * 6)
-            for side in sides:
-                service = f"/{self.robot_name()}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
-                self.ros_worker.call_trigger(service, f"disarm before freedrive {SIDES[side]}")
-                self.ros_worker.switch_freedrive(self.robot_name(), side, True, fallback)
+            for robot, side in pairs:
+                service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
+                self.ros_worker.call_trigger(
+                    service, f"disarm before freedrive {robot}/{SIDES[side]}"
+                )
+                self.ros_worker.switch_freedrive(robot, side, True, fallback)
             return
 
         self.append_log("[gui] Disabling freedrive and restoring previous motion controllers")
-        for side in sides:
-            self.ros_worker.switch_freedrive(self.robot_name(), side, False, fallback)
+        for robot, side in pairs:
+            self.ros_worker.switch_freedrive(robot, side, False, fallback)
 
     def open_demos(self):
         dialog = DemoDialog(self, self)
@@ -1354,25 +1682,25 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self.append_log("[gui] Refusing demo: no arm selected")
             return
         blocked = []
-        for side in sides:
-            status = self.arm_status.get(side, "unknown")
+        for robot, side in self.robot_arm_pairs(sides=sides):
+            status = self.arm_status.get((robot, side), "unknown")
             if status != "armed":
-                blocked.append(f"{SIDES[side]}={status}")
+                blocked.append(f"{robot}/{SIDES[side]}={status}")
         if blocked:
             self.append_log(
                 "[gui] Refusing demo: press START MOTION first; " + ", ".join(blocked)
             )
             return
-        process = self.processes.get("demo")
+        object_host = self.object_host()
+        process = self.processes.get(self.process_key(object_host, "demo"))
         if process is not None and process.state() != QtCore.QProcess.NotRunning:
             self.append_log("[gui] demo already running")
             return
-        robot = self.robot_name()
         cmd = (
-            setup_prefix()
+            self.remote_setup_prefix()
             + "exec ros2 run match_cooperative_handling virtual_object_demo_runner --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p world_frame:={robot}/base_link "
+            + f"-p robot_name:={object_host} "
+            + f"-p world_frame:={WORLD_FRAME} "
             + f"-p demo_name:={demo_name} "
             + f"-p xy_amplitude:={xy_amplitude:.4f} "
             + f"-p z_lift:={z_lift:.4f} "
@@ -1385,15 +1713,19 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.append_log(
             "[gui] Starting demo. The demo only publishes virtual object twist commands."
         )
-        self.start_process("demo", cmd)
+        self.start_process(
+            self.process_key(object_host, "demo"),
+            self.remote_command(object_host, cmd),
+        )
 
     def stop_demo(self):
-        process = self.processes.get("demo")
-        if process is not None and process.state() != QtCore.QProcess.NotRunning:
-            self.append_log("[gui] stopping demo")
-            process.terminate()
-            if not process.waitForFinished(1000):
-                process.kill()
+        for robot in ROBOTS:
+            process = self.processes.get(self.process_key(robot, "demo"))
+            if process is not None and process.state() != QtCore.QProcess.NotRunning:
+                self.append_log(f"[gui] stopping demo on {robot}")
+                process.terminate()
+                if not process.waitForFinished(1000):
+                    process.kill()
         self.ros_worker.publish_object_twist([0.0] * 6)
 
     def start_tracking_log(self):
@@ -1401,34 +1733,40 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         if not sides:
             self.append_log("[gui] Refusing tracking log: no arm selected")
             return
-        robot = self.robot_name()
         arms = ",".join(sides)
-        output_dir = os.path.join(WS, "src", "match_cooperative_handling", "logs", "tracking")
-        cmd = (
-            setup_prefix()
-            + "exec ros2 run match_cooperative_handling log_cooperative_tracking.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p arms:={arms} "
-            + "-p duration:=300.0 "
-            + "-p sample_rate_hz:=50.0 "
-            + f"-p output_dir:={shlex.quote(output_dir)}"
-        )
-        self.append_log(f"[gui] Starting cooperative tracking logger for: {arms}")
-        self.start_process("tracking_log", cmd)
+        for robot in self.selected_robots():
+            output_dir = os.path.join(
+                self.remote_ws(), "src", "match_cooperative_handling", "logs", "tracking"
+            )
+            cmd = (
+                self.remote_setup_prefix()
+                + "exec ros2 run match_cooperative_handling log_cooperative_tracking.py --ros-args "
+                + f"-p robot_name:={robot} "
+                + f"-p arms:={arms} "
+                + "-p duration:=300.0 "
+                + "-p sample_rate_hz:=50.0 "
+                + f"-p output_dir:={shlex.quote(output_dir)}"
+            )
+            self.append_log(f"[gui] Starting cooperative tracking logger for {robot}: {arms}")
+            self.start_process(
+                self.process_key(robot, "tracking_log"),
+                self.remote_command(robot, cmd),
+            )
 
     def stop_tracking_log(self):
-        process = self.processes.get("tracking_log")
-        if process is not None and process.state() != QtCore.QProcess.NotRunning:
-            self.append_log("[gui] stopping tracking logger")
-            self.ros_worker.publish_tracking_stop()
-            if process.waitForFinished(2000):
-                return
-            process.terminate()
-            if not process.waitForFinished(1000):
-                process.kill()
+        for robot in ROBOTS:
+            process = self.processes.get(self.process_key(robot, "tracking_log"))
+            if process is not None and process.state() != QtCore.QProcess.NotRunning:
+                self.append_log(f"[gui] stopping tracking logger on {robot}")
+                self.ros_worker.publish_tracking_stop()
+                if process.waitForFinished(2000):
+                    continue
+                process.terminate()
+                if not process.waitForFinished(1000):
+                    process.kill()
 
     def open_rviz(self):
-        robot = self.robot_name()
+        robot = self.object_host()
         config_path = (
             "$(ros2 pkg prefix mur_launch_hardware)"
             "/share/mur_launch_hardware/config/rviz/mur620d_moveit.rviz"
@@ -1449,11 +1787,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
 
     def move_home(self, side):
         prefix = SIDES[side]
-        if self.freedrive_active.get(side, False):
-            self.append_log(f"[gui] Home {prefix}: disabling freedrive first")
-            self.ros_worker.switch_freedrive(
-                self.robot_name(), side, False, self.fallback_motion_controller()
-            )
+        for robot in self.selected_robots():
+            if self.freedrive_active.get((robot, side), False):
+                self.append_log(f"[gui] Home {robot}/{prefix}: disabling freedrive first")
+                self.ros_worker.switch_freedrive(
+                    robot, side, False, self.fallback_motion_controller()
+                )
         if not self.opt_moveit.isChecked():
             self.append_log(
                 f"[gui] Home {prefix}: Launch MoveIt is disabled. "
@@ -1464,65 +1803,100 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             "START MOTION is not required for Home."
         )
         self.ros_worker.publish_object_twist([0.0] * 6)
-        service = f"/{self.robot_name()}/{prefix}/virtual_object_tcp_transform_node/stop"
-        self.ros_worker.call_trigger(service, f"disarm before home {prefix}")
+        for robot in self.selected_robots():
+            service = f"/{robot}/{prefix}/virtual_object_tcp_transform_node/stop"
+            self.ros_worker.call_trigger(service, f"disarm before home {robot}/{prefix}")
         QtCore.QTimer.singleShot(500, partial(self._start_home_process, side))
 
     def _start_home_process(self, side):
         prefix = SIDES[side]
-        robot = self.robot_name()
-        cmd = (
-            setup_prefix()
-            + "exec ros2 run match_cooperative_handling move_arm_to_named_pose.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p robot_profile:={self.robot_profile()} "
-            + f"-p arm:={side} "
-            + f"-p group:=UR_arm_{side} "
-            + "-p named_pose:=Home_custom "
-            + f"-p velocity_scaling:={self.moveit_velocity_scaling():.3f}"
-        )
-        self.start_process(f"home_{side}", cmd)
+        for robot in self.selected_robots():
+            cmd = (
+                self.remote_setup_prefix()
+                + "exec ros2 run match_cooperative_handling move_arm_to_named_pose.py --ros-args "
+                + f"-p robot_name:={robot} "
+                + f"-p robot_profile:={self.robot_profile(robot)} "
+                + f"-p arm:={side} "
+                + f"-p group:=UR_arm_{side} "
+                + "-p named_pose:=Home_custom "
+                + f"-p velocity_scaling:={self.moveit_velocity_scaling():.3f}"
+            )
+            self.start_process(
+                self.process_key(robot, f"home_{side}"),
+                self.remote_command(robot, cmd),
+            )
 
     def start_motion(self):
         sides = self.selected_sides()
         if not sides:
             self.append_log("[gui] Refusing start: no arm selected")
             return
-        freedrive = [SIDES[side] for side in sides if self.freedrive_active.get(side, False)]
+        pairs = self.robot_arm_pairs(sides=sides)
+        freedrive = [
+            f"{robot}/{SIDES[side]}"
+            for robot, side in pairs
+            if self.freedrive_active.get((robot, side), False)
+        ]
         if freedrive:
             self.append_log(
                 "[gui] Refusing start: disable freedrive first for " + ", ".join(freedrive)
             )
             return
-        self.ensure_ur_ready(sides=sides, on_success=lambda: self._start_motion_after_ready(sides))
+        self.ensure_ur_ready(
+            sides=sides,
+            robots=self.selected_robots(),
+            on_success=lambda: self._start_motion_after_ready(pairs),
+        )
 
-    def _start_motion_after_ready(self, sides):
+    def _start_motion_after_ready(self, pairs):
         blocked = []
-        for side in sides:
-            status = self.arm_status.get(side, "unknown")
+        for robot, side in pairs:
+            status = self.arm_status.get((robot, side), "unknown")
             if not (status == "ready" or status == "armed"):
-                blocked.append(f"{SIDES[side]}={status}")
-            if not self.ur_reverse_ready.get(side, False):
-                blocked.append(f"{SIDES[side]}=UR reverse missing")
+                blocked.append(f"{robot}/{SIDES[side]}={status}")
+            if not self.ur_reverse_ready.get((robot, side), False):
+                blocked.append(f"{robot}/{SIDES[side]}=UR reverse missing")
         if blocked:
             self.append_log("[gui] Refusing start: " + ", ".join(blocked))
             return
-        for side in sides:
-            service = f"/{self.robot_name()}/{SIDES[side]}/virtual_object_tcp_transform_node/start"
-            self.ros_worker.call_trigger(service, f"start {SIDES[side]}")
+        for robot, side in pairs:
+            service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/start"
+            self.ros_worker.call_trigger(service, f"start {robot}/{SIDES[side]}")
 
     def stop_motion(self):
         self.stop_demo()
         self.ros_worker.publish_object_twist([0.0] * 6)
-        for side in self.selected_sides() or ["r", "l"]:
-            service = f"/{self.robot_name()}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
-            self.ros_worker.call_trigger(service, f"stop {SIDES[side]}")
+        robots = self.selected_robots() or ROBOTS
+        sides = self.selected_sides() or ["r", "l"]
+        for robot in robots:
+            for side in sides:
+                service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
+                self.ros_worker.call_trigger(service, f"stop {robot}/{SIDES[side]}")
 
     def stop_managed_processes(self):
         self.stop_tracking_log()
         self.stop_object_nodes(start_after_cleanup=False)
+        cleanup_patterns = [
+            "virtual_object_demo_runner",
+            "log_cooperative_tracking.py",
+            "move_arm_to_named_pose.py",
+        ]
+        cleanup_cmd = " ; ".join(
+            f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true"
+            for pattern in cleanup_patterns
+        )
+        cleanup_cmd += " ; sleep 0.5 ; "
+        cleanup_cmd += " ; ".join(
+            f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
+            for pattern in cleanup_patterns
+        )
+        for robot in self.selected_robots():
+            self.start_process(
+                self.process_key(robot, "remote_cleanup"),
+                self.remote_command(robot, cleanup_cmd),
+            )
         for name, process in list(self.processes.items()):
-            if name == "object_cleanup":
+            if name == "object_cleanup" or name.endswith(":remote_cleanup"):
                 continue
             if process.state() == QtCore.QProcess.NotRunning:
                 continue
