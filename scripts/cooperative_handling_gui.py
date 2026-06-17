@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 import time
+import math
 from functools import partial
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -20,7 +21,8 @@ from controller_manager_msgs.srv import (
 )
 from geometry_msgs.msg import TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
-from std_msgs.msg import Bool, String
+from sensor_msgs.msg import BatteryState
+from std_msgs.msg import Bool, Float32, String
 from std_srvs.srv import Trigger
 
 
@@ -74,10 +76,67 @@ def setup_prefix(ws=WS):
     )
 
 
+class BatteryBadge(QtWidgets.QWidget):
+    def __init__(self, label, parent=None):
+        super().__init__(parent)
+        self.label = label
+        self.value = None
+        self.setFixedSize(78, 24)
+        self.setToolTip(f"{label} battery: no data")
+
+    def set_value(self, value):
+        if value is None or not math.isfinite(value):
+            self.value = None
+            self.setToolTip(f"{self.label} battery: no data")
+        else:
+            self.value = max(0.0, min(100.0, float(value)))
+            self.setToolTip(f"{self.label} battery: {self.value:.0f}%")
+        self.update()
+
+    def color(self):
+        if self.value is None:
+            return QtGui.QColor("#a0aec0")
+        if self.value >= 50.0:
+            return QtGui.QColor("#48bb78")
+        if self.value >= 30.0:
+            return QtGui.QColor("#ecc94b")
+        if self.value >= 15.0:
+            return QtGui.QColor("#ed8936")
+        return QtGui.QColor("#e53e3e")
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        outline = QtGui.QColor("#4a5568")
+        body = QtCore.QRectF(1.5, 5.0, 24.0, 14.0)
+        terminal = QtCore.QRectF(25.5, 9.0, 3.0, 6.0)
+        painter.setPen(QtGui.QPen(outline, 1.2))
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawRoundedRect(body, 2.0, 2.0)
+        painter.drawRect(terminal)
+
+        fill_width = 0.0 if self.value is None else (body.width() - 4.0) * self.value / 100.0
+        if fill_width > 0.0:
+            fill = QtCore.QRectF(body.left() + 2.0, body.top() + 2.0, fill_width, body.height() - 4.0)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(self.color())
+            painter.drawRoundedRect(fill, 1.2, 1.2)
+
+        text = f"{self.label} --%" if self.value is None else f"{self.label} {self.value:.0f}%"
+        painter.setPen(QtGui.QColor("#1a202c"))
+        font = painter.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(QtCore.QRectF(32.0, 0.0, 45.0, 24.0), QtCore.Qt.AlignVCenter, text)
+
+
 class RosWorker(QtCore.QThread):
     log = QtCore.pyqtSignal(str)
     status = QtCore.pyqtSignal(str, str, str)
     freedrive_status = QtCore.pyqtSignal(str, str, bool, str)
+    battery_status = QtCore.pyqtSignal(str, str, float, bool)
 
     def __init__(self, robot_names=None):
         super().__init__()
@@ -86,6 +145,7 @@ class RosWorker(QtCore.QThread):
         self._object_twist_pub = None
         self._tracking_stop_pub = None
         self._status_subs = []
+        self._battery_subs = []
         self._previous_freedrive_controllers = {}
         self._freedrive_enable_pubs = {}
         self._freedrive_keepalive = {}
@@ -104,6 +164,7 @@ class RosWorker(QtCore.QThread):
             Bool, "/cooperative_tracking_logger/stop", 10
         )
         self._configure_status_subscriptions(self.robot_names)
+        self._configure_battery_subscriptions(self.robot_names)
         self._ready.set()
         self.log.emit("[ros] GUI ROS helper started")
         while rclpy.ok() and not self._stop.is_set():
@@ -121,6 +182,7 @@ class RosWorker(QtCore.QThread):
         self.robot_names = list(robot_names or ["mur620d"])
         if self._ready.wait(timeout=1.0):
             self._configure_status_subscriptions(self.robot_names)
+            self._configure_battery_subscriptions(self.robot_names)
 
     def _configure_status_subscriptions(self, robot_names):
         with self._lock:
@@ -142,6 +204,37 @@ class RosWorker(QtCore.QThread):
 
     def _on_status(self, robot_name, side, msg):
         self.status.emit(robot_name, side, msg.data)
+
+    def _configure_battery_subscriptions(self, robot_names):
+        with self._lock:
+            if self._node is None:
+                return
+            for sub in self._battery_subs:
+                self._node.destroy_subscription(sub)
+            self._battery_subs = []
+            for robot_name in robot_names:
+                mur_sub = self._node.create_subscription(
+                    Float32,
+                    f"/{robot_name}/bms_status/SOC",
+                    partial(self._on_mur_battery, robot_name),
+                    10,
+                )
+                mir_sub = self._node.create_subscription(
+                    BatteryState,
+                    f"/{robot_name}/battery_state",
+                    partial(self._on_mir_battery, robot_name),
+                    10,
+                )
+                self._battery_subs.extend([mur_sub, mir_sub])
+
+    def _on_mur_battery(self, robot_name, msg):
+        self.battery_status.emit(robot_name, "mur", float(msg.data), True)
+
+    def _on_mir_battery(self, robot_name, msg):
+        percentage = float(msg.percentage)
+        if 0.0 <= percentage <= 1.0:
+            percentage *= 100.0
+        self.battery_status.emit(robot_name, "mir", percentage, math.isfinite(percentage))
 
     def call_trigger(self, service_name, label):
         if not self._ready.wait(timeout=1.0):
@@ -737,11 +830,13 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.connected_robots = set()
         self.connect_status = {}
         self.connect_messages = {}
+        self.battery_values = {}
 
         self.ros_worker = RosWorker(["mur620d"])
         self.ros_worker.log.connect(self.append_log)
         self.ros_worker.status.connect(self.update_arm_status)
         self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
+        self.ros_worker.battery_status.connect(self.update_battery_status)
         self.ros_worker.start()
 
         central = QtWidgets.QWidget()
@@ -826,12 +921,25 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         robot_layout = QtWidgets.QVBoxLayout(robot_checks)
         robot_layout.setContentsMargins(0, 0, 0, 0)
         self.robot_checks = {}
+        self.battery_badges = {}
         for robot in ROBOTS:
+            row_widget = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
             check = QtWidgets.QCheckBox(robot)
             check.setChecked(robot == "mur620d")
             check.toggled.connect(lambda _checked: self.on_robot_selection_changed())
             self.robot_checks[robot] = check
-            robot_layout.addWidget(check)
+            row.addWidget(check)
+            row.addStretch(1)
+            mir_badge = BatteryBadge("MiR")
+            mur_badge = BatteryBadge("MuR")
+            self.battery_badges[(robot, "mir")] = mir_badge
+            self.battery_badges[(robot, "mur")] = mur_badge
+            row.addWidget(mir_badge)
+            row.addWidget(mur_badge)
+            robot_layout.addWidget(row_widget)
         layout.addRow("MuRs", robot_checks)
         self.opt_sync_code = QtWidgets.QCheckBox("Sync Code")
         self.opt_sync_code.setChecked(True)
@@ -987,14 +1095,25 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         return "forward_velocity_controller"
 
     def on_robot_selection_changed(self):
-        self.ros_worker.set_robot_names(self.selected_robots())
+        selected = self.selected_robots()
+        self.ros_worker.set_robot_names(selected)
         for robot in ROBOTS:
             for side in SIDES:
                 self.arm_status[(robot, side)] = "unknown"
                 self.ur_reverse_ready[(robot, side)] = False
+            if robot not in selected:
+                for source in ("mir", "mur"):
+                    self.update_battery_status(robot, source, 0.0, False)
         self.refresh_status_labels()
         self.update_connect_button()
         self.update_freedrive_button()
+
+    def update_battery_status(self, robot, source, percentage, valid):
+        key = (robot, source)
+        self.battery_values[key] = percentage if valid else None
+        badge = getattr(self, "battery_badges", {}).get(key)
+        if badge is not None:
+            badge.set_value(percentage if valid else None)
 
     def update_arm_status(self, robot, side, status):
         self.arm_status[(robot, side)] = status
@@ -1282,9 +1401,21 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self._start_hardware_after_preflight(robot)
 
     def _start_hardware_after_preflight(self, robot):
+        ur_hosts = []
+        if self.arm_l.isChecked():
+            ur_hosts.append("UR10_l")
+        if self.arm_r.isChecked():
+            ur_hosts.append("UR10_r")
+        ur_network_prefix = ""
+        if ur_hosts:
+            ur_network_prefix = (
+                "export MUR_CHECK_UR_NETWORK=true; "
+                f"export MUR_UR_HOSTS={shlex.quote(' '.join(ur_hosts))}; "
+            )
         preflight_cmd = self.remote_command(
             robot,
-            f"test -x {shlex.quote(self.remote_host_setup_script())} && "
+            ur_network_prefix
+            + f"test -x {shlex.quote(self.remote_host_setup_script())} && "
             f"{shlex.quote(self.remote_host_setup_script())} --check",
         )
 
@@ -1321,6 +1452,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             f"integrated_controller_enable_collision_avoidance:={'true' if self.opt_collision.isChecked() else 'false'}",
             f"integrated_controller_publish_collision_markers:={'true' if self.opt_markers.isChecked() else 'false'}",
             f"launch_moveit:={'true' if self.opt_moveit.isChecked() else 'false'}",
+            "launch_bms:=true",
+            "bms_can_interface:=can0",
+            "bms_can_bitrate:=250000",
             "auto_switch_moveit_controllers:=true",
             "launch_moveit_rviz:=false",
         ]
@@ -1340,6 +1474,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 f"export ROBOT_PROFILE={shlex.quote(robot)};",
                 f"export BUILD_BEFORE_LAUNCH={'true' if self.opt_build.isChecked() else 'false'};",
                 "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_cooperative_handling';",
+                f"export MUR_CHECK_UR_NETWORK={'true' if self.selected_sides() else 'false'};",
+                f"export MUR_UR_HOSTS={shlex.quote(' '.join(['UR10_l' if side == 'l' else 'UR10_r' for side in self.selected_sides()]))};",
                 f"export INTEGRATED_CARTESIAN_ACTIVE={'true' if self.opt_integrated.isChecked() else 'false'};",
                 f"export INTEGRATED_CARTESIAN_USE_FT={'true' if self.opt_ft.isChecked() else 'false'};",
                 f"export INTEGRATED_CARTESIAN_REQUIRE_WRENCH={'true' if self.opt_require_wrench.isChecked() else 'false'};",
