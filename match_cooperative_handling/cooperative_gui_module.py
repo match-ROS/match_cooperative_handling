@@ -13,7 +13,7 @@ from geometry_msgs.msg import TwistStamped
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import Bool, String
 
-from match_mur_gui.base_gui import MurGuiModule, ROBOTS, SIDES
+from match_mur_gui.base_gui import MurGuiModule, ROBOTS, SIDES, WS
 
 
 WORLD_FRAME = "map"
@@ -389,8 +389,17 @@ class CooperativeHandlingModule(MurGuiModule):
     def remote_command(self, robot, command):
         return self.context.remote_command(robot, command)
 
-    def remote_setup_prefix(self):
-        return self.context.remote_setup_prefix()
+    def command_for_robot(self, robot, command):
+        if self.context.simulation_mode():
+            return command
+        return self.context.remote_command(robot, command)
+
+    def ros_command_for_robot(self, robot, command):
+        return self.context.robot_ros_command(
+            robot,
+            command,
+            build_packages="match_cooperative_handling" if self.context.simulation_mode() else "",
+        )
 
     def start_process(self, name, command, env=None, on_finished=None):
         self.context.start_process(name, command, env=env, on_finished=on_finished)
@@ -442,8 +451,11 @@ class CooperativeHandlingModule(MurGuiModule):
             f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
             for pattern in cleanup_patterns
         )
-        remote_cleanup = [self.remote_command(robot, cleanup_cmd) for robot in self.selected_robots()]
-        if remote_cleanup:
+        remote_cleanup = [
+            self.command_for_robot(robot, cleanup_cmd)
+            for robot in self.selected_robots()
+        ]
+        if remote_cleanup and not self.context.simulation_mode():
             cleanup_cmd = " ; ".join(remote_cleanup)
 
         if start_after_cleanup:
@@ -461,30 +473,27 @@ class CooperativeHandlingModule(MurGuiModule):
         object_host = self.object_host()
         self.ros_bridge.set_robot_names(self.selected_robots())
         map_cmd = (
-            self.remote_setup_prefix()
-            + f"exec ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "
+            f"exec ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "
             + f"{WORLD_FRAME} {object_host}/base_link"
         )
         self.start_process(
             self.process_key(object_host, "map_tf"),
-            self.remote_command(object_host, map_cmd),
+            self.ros_command_for_robot(object_host, map_cmd),
         )
         state_cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling virtual_object_state_node --ros-args "
+            "exec ros2 run match_cooperative_handling virtual_object_state_node --ros-args "
             + f"-p world_frame:={WORLD_FRAME} "
             + "-p rate:=500.0"
         )
         self.start_process(
             self.process_key(object_host, "object_state"),
-            self.remote_command(object_host, state_cmd),
+            self.ros_command_for_robot(object_host, state_cmd),
         )
         for robot in self.selected_robots():
             for side in self.selected_sides():
                 prefix = SIDES[side]
                 transform_cmd = (
-                    self.remote_setup_prefix()
-                    + "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
+                    "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
                     + f"-r __ns:=/{robot}/{prefix} "
                     + f"-p robot_name:={robot} "
                     + f"-p arm:={side} "
@@ -493,22 +502,21 @@ class CooperativeHandlingModule(MurGuiModule):
                 )
                 self.start_process(
                     self.process_key(robot, f"object_transform_{side}"),
-                    self.remote_command(robot, transform_cmd),
+                    self.ros_command_for_robot(robot, transform_cmd),
                 )
 
     def set_from_tcp(self):
         side = "r" if "r" in self.selected_sides() else "l"
         robot = self.object_host()
         cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling set_virtual_object_from_tcp.py --ros-args "
+            "exec ros2 run match_cooperative_handling set_virtual_object_from_tcp.py --ros-args "
             + f"-p robot_name:={robot} "
             + f"-p arm:={side} "
             + f"-p world_frame:={WORLD_FRAME}"
         )
         self.start_process(
             self.process_key(robot, f"set_from_tcp_{side}"),
-            self.remote_command(robot, cmd),
+            self.ros_command_for_robot(robot, cmd),
         )
 
     def set_object_center(self):
@@ -519,8 +527,7 @@ class CooperativeHandlingModule(MurGuiModule):
         robot = self.object_host()
         arms = ",".join(sides)
         cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling "
+            "exec ros2 run match_cooperative_handling "
             + "set_virtual_object_from_manipulators.py --ros-args "
             + f"-p robot_name:={robot} "
             + f"-p arms:={arms} "
@@ -531,7 +538,7 @@ class CooperativeHandlingModule(MurGuiModule):
         )
         self.start_process(
             self.process_key(robot, "set_object_center"),
-            self.remote_command(robot, cmd),
+            self.ros_command_for_robot(robot, cmd),
         )
 
     def set_current_offsets(self):
@@ -542,8 +549,7 @@ class CooperativeHandlingModule(MurGuiModule):
         arms = ",".join(sides)
         for robot in self.selected_robots():
             cmd = (
-                self.remote_setup_prefix()
-                + "exec ros2 run match_cooperative_handling "
+                "exec ros2 run match_cooperative_handling "
                 + "set_relative_pose_from_current_object.py --ros-args "
                 + f"-p robot_name:={robot} "
                 + f"-p arms:={arms} "
@@ -556,7 +562,7 @@ class CooperativeHandlingModule(MurGuiModule):
             )
             self.start_process(
                 self.process_key(robot, "set_current_offsets"),
-                self.remote_command(robot, cmd),
+                self.ros_command_for_robot(robot, cmd),
             )
 
     def open_object_jog(self):
@@ -603,8 +609,7 @@ class CooperativeHandlingModule(MurGuiModule):
             self.append_log("[gui] demo already running")
             return
         cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling virtual_object_demo_runner --ros-args "
+            "exec ros2 run match_cooperative_handling virtual_object_demo_runner --ros-args "
             + f"-p robot_name:={object_host} "
             + f"-p world_frame:={WORLD_FRAME} "
             + f"-p demo_name:={demo_name} "
@@ -621,7 +626,7 @@ class CooperativeHandlingModule(MurGuiModule):
         )
         self.start_process(
             self.process_key(object_host, "demo"),
-            self.remote_command(object_host, cmd),
+            self.ros_command_for_robot(object_host, cmd),
         )
 
     def stop_demo(self):
@@ -641,16 +646,16 @@ class CooperativeHandlingModule(MurGuiModule):
             return
         arms = ",".join(sides)
         for robot in self.selected_robots():
+            output_root = WS if self.context.simulation_mode() else self.context.window.remote_ws()
             output_dir = os.path.join(
-                self.context.window.remote_ws(),
+                output_root,
                 "src",
                 "match_cooperative_handling",
                 "logs",
                 "tracking",
             )
             cmd = (
-                self.remote_setup_prefix()
-                + "exec ros2 run match_cooperative_handling log_cooperative_tracking.py --ros-args "
+                "exec ros2 run match_cooperative_handling log_cooperative_tracking.py --ros-args "
                 + f"-p robot_name:={robot} "
                 + f"-p arms:={arms} "
                 + "-p duration:=300.0 "
@@ -660,7 +665,7 @@ class CooperativeHandlingModule(MurGuiModule):
             self.append_log(f"[gui] Starting cooperative tracking logger for {robot}: {arms}")
             self.start_process(
                 self.process_key(robot, "tracking_log"),
-                self.remote_command(robot, cmd),
+                self.ros_command_for_robot(robot, cmd),
             )
 
     def stop_tracking_log(self):
