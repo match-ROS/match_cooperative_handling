@@ -8,13 +8,14 @@ from PyQt5 import QtWidgets
 
 from match_cooperative_handling.cooperative_gui_module import CooperativeHandlingModule
 from match_mur_gui.base_gui import MurBaseGui
+from oak_camera_calibration.oak_gui_module import OakCameraModule
 
 
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QtWidgets.QApplication(sys.argv)
     window = MurBaseGui(
-        modules=[CooperativeHandlingModule()],
+        modules=[CooperativeHandlingModule(), OakCameraModule()],
         window_title="MuR Cooperative Handling",
     )
     window.show()

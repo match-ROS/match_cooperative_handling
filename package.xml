@@ -24,6 +24,7 @@
   <exec_depend>match_mur_gui</exec_depend>
   <exec_depend>moveit_configs_utils</exec_depend>
   <exec_depend>moveit_py</exec_depend>
+  <exec_depend>oak_camera_calibration</exec_depend>
   <exec_depend>python3-pyqt5</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>ur_dashboard_msgs</exec_depend>
