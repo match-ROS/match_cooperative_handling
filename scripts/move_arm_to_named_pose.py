@@ -91,7 +91,7 @@ def get_robot_trajectory_msg(robot_trajectory):
     )
 
 
-def arm_controller_config(controller_namespace):
+def arm_controller_config(controller_namespace, use_lift=True):
     controller_prefix = f"/{controller_namespace}" if controller_namespace else ""
     left_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_l"
     right_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_r"
@@ -113,7 +113,7 @@ def arm_controller_config(controller_namespace):
         "UR10_r/wrist_2_joint",
         "UR10_r/wrist_3_joint",
     ]
-    return {
+    config = {
         "moveit_controller_manager": "moveit_simple_controller_manager/MoveItSimpleControllerManager",
         "trajectory_execution": {
             "allowed_execution_duration_scaling": 1.2,
@@ -154,6 +154,13 @@ def arm_controller_config(controller_namespace):
             },
         },
     }
+
+    if not use_lift:
+        controllers = config["moveit_simple_controller_manager"]
+        controllers["controller_names"] = [left_controller, right_controller]
+        del controllers[left_lift_controller]
+        del controllers[right_lift_controller]
+    return config
 
 
 def load_robot_profile(robot_profile):
@@ -216,6 +223,7 @@ def robot_description_source(robot_name, robot_profile, ur_type):
     srdf_xacro_mappings = {
         "home_custom_l_shoulder_pan": home_custom_l_shoulder_pan,
         "home_custom_r_shoulder_pan": home_custom_r_shoulder_pan,
+        "use_lift": robot_xacro_mappings["use_lift"],
     }
     return xacro_file, robot_xacro_mappings, srdf_xacro_mappings
 
@@ -265,13 +273,16 @@ class MoveArmToNamedPose(Node):
                     "home_custom_r_shoulder_pan": srdf_xacro_mappings[
                         "home_custom_r_shoulder_pan"
                     ],
+                    "use_lift": srdf_xacro_mappings["use_lift"],
                 },
             )
             .moveit_cpp(file_path="config/moveit_cpp.yaml")
             .to_moveit_configs()
             .to_dict()
         )
-        moveit_config.update(arm_controller_config(self.robot_name))
+        moveit_config.update(
+            arm_controller_config(self.robot_name, robot_xacro_mappings["use_lift"] == "true")
+        )
         moveit_config["use_sim_time"] = False
         return moveit_config
 

@@ -13,7 +13,9 @@ from geometry_msgs.msg import TwistStamped
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import Bool, String
 
-from match_mur_gui.base_gui import MurGuiModule, ROBOTS, SIDES, WS
+from match_mur_gui.base_gui import MurGuiModule, ROBOTS, SIDES
+
+from .top_view import TopViewPanel, TopViewRosWorker
 
 
 WORLD_FRAME = "map"
@@ -30,7 +32,6 @@ class CooperativeRosBridge(QtCore.QThread):
         self._object_twist_pub = None
         self._tracking_stop_pub = None
         self._status_subs = []
-        self._ready = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._owns_rclpy = False
@@ -50,10 +51,15 @@ class CooperativeRosBridge(QtCore.QThread):
             Bool, "/cooperative_tracking_logger/stop", 10
         )
         self._configure_status_subscriptions(self.robot_names)
-        self._ready.set()
+        subscribed_names = tuple(self.robot_names)
         self.log.emit("[ros] Cooperative GUI bridge started")
         try:
             while rclpy.ok() and not self._stop.is_set():
+                with self._lock:
+                    names = tuple(self.robot_names)
+                if names != subscribed_names:
+                    self._configure_status_subscriptions(names)
+                    subscribed_names = names
                 rclpy.spin_once(self._node, timeout_sec=0.05)
         except (KeyboardInterrupt, ExternalShutdownException):
             pass
@@ -70,27 +76,25 @@ class CooperativeRosBridge(QtCore.QThread):
         self._stop.set()
 
     def set_robot_names(self, robot_names):
-        self.robot_names = list(robot_names or ["mur620d"])
-        if self._ready.wait(timeout=1.0):
-            self._configure_status_subscriptions(self.robot_names)
+        with self._lock:
+            self.robot_names = list(robot_names or ["mur620d"])
 
     def _configure_status_subscriptions(self, robot_names):
-        with self._lock:
-            if self._node is None:
-                return
-            for sub in self._status_subs:
-                self._node.destroy_subscription(sub)
-            self._status_subs = []
-            for robot_name in robot_names:
-                for side, prefix in SIDES.items():
-                    topic = f"/{robot_name}/{prefix}/virtual_object_tcp_transform_node/status"
-                    sub = self._node.create_subscription(
-                        String,
-                        topic,
-                        partial(self._on_status, robot_name, side),
-                        10,
-                    )
-                    self._status_subs.append(sub)
+        if self._node is None:
+            return
+        for sub in self._status_subs:
+            self._node.destroy_subscription(sub)
+        self._status_subs = []
+        for robot_name in robot_names:
+            for side, prefix in SIDES.items():
+                topic = f"/{robot_name}/{prefix}/virtual_object_tcp_transform_node/status"
+                sub = self._node.create_subscription(
+                    String,
+                    topic,
+                    partial(self._on_status, robot_name, side),
+                    10,
+                )
+                self._status_subs.append(sub)
 
     def _on_status(self, robot_name, side, msg):
         self.status.emit(robot_name, side, msg.data)
@@ -180,7 +184,10 @@ class ObjectJogDialog(QtWidgets.QDialog):
     def _set_axis(self, vector):
         self.active = [0.0] * 6
         offset = 0 if self.mode == "translation" else 3
-        speed = self.linear_speed.value() if self.mode == "translation" else self.angular_speed.value()
+        speed = (
+            self.linear_speed.value() if self.mode == "translation"
+            else self.angular_speed.value()
+        )
         for index, value in enumerate(vector):
             self.active[offset + index] = value * speed
 
@@ -330,6 +337,9 @@ class CooperativeHandlingModule(MurGuiModule):
     def __init__(self):
         self.context = None
         self.ros_bridge = None
+        self.top_view_worker = None
+        self.top_view_panel = None
+        self.temporary_map_anchor_button = None
         self._jog_dialog = None
         self._demo_dialog = None
 
@@ -340,19 +350,44 @@ class CooperativeHandlingModule(MurGuiModule):
         self.ros_bridge.status.connect(context.set_arm_status)
         self.ros_bridge.start()
 
-        context.add_action_button("Start Object Nodes", self.start_object_nodes, section="Cooperative")
+        context.add_action_button(
+            "Start Object Nodes", self.start_object_nodes, section="Cooperative"
+        )
+        self.temporary_map_anchor_button = context.add_action_button(
+            "Temporary map anchor: OFF", self._map_anchor_toggled, section="Cooperative"
+        )
+        self.temporary_map_anchor_button.setCheckable(True)
+        self.temporary_map_anchor_button.setToolTip(
+            "On the next Start Object Nodes, publish map -> object host/base_link as identity. "
+            "Use only while no real map pose is available."
+        )
         context.add_action_button("Set From TCP", self.set_from_tcp, section="Cooperative")
         context.add_action_button("Open Object Jog", self.open_object_jog, section="Cooperative")
         context.add_tool_button("Demos", self.open_demos, section="Cooperative")
-        context.add_tool_button("Start Tracking Log", self.start_tracking_log, section="Cooperative")
+        context.add_tool_button(
+            "Start Tracking Log", self.start_tracking_log, section="Cooperative"
+        )
         context.add_tool_button("Stop Tracking Log", self.stop_tracking_log, section="Cooperative")
         context.add_tool_button("Set Object Center", self.set_object_center, section="Cooperative")
-        context.add_tool_button("Set Current Offsets", self.set_current_offsets, section="Cooperative")
+        context.add_tool_button(
+            "Set Current Offsets", self.set_current_offsets, section="Cooperative"
+        )
+
+        self.top_view_panel = context.add_panel(TopViewPanel(context.window))
+        self.top_view_worker = TopViewRosWorker(
+            context.checked_robots(), context.selected_sides()
+        )
+        self.top_view_worker.snapshot.connect(self.top_view_panel.update_snapshot)
+        self.top_view_worker.log.connect(context.append_log)
+        self.top_view_worker.start()
+        context.window.arm_r.toggled.connect(self.on_view_selection_changed)
+        context.window.arm_l.toggled.connect(self.on_view_selection_changed)
 
         self.start_motion_button = QtWidgets.QPushButton("START MOTION")
         self.start_motion_button.setMinimumSize(220, 72)
         self.start_motion_button.setStyleSheet(
-            "QPushButton { background: #1f9d55; color: white; font-size: 22px; font-weight: bold; }"
+            "QPushButton { background: #1f9d55; color: white; font-size: 22px; "
+            "font-weight: bold; }"
         )
         self.start_motion_button.clicked.connect(self.start_motion)
         context.add_bottom_widget(self.start_motion_button)
@@ -360,7 +395,8 @@ class CooperativeHandlingModule(MurGuiModule):
         self.stop_motion_button = QtWidgets.QPushButton("STOP MOTION")
         self.stop_motion_button.setMinimumSize(220, 72)
         self.stop_motion_button.setStyleSheet(
-            "QPushButton { background: #c53030; color: white; font-size: 22px; font-weight: bold; }"
+            "QPushButton { background: #c53030; color: white; font-size: 22px; "
+            "font-weight: bold; }"
         )
         self.stop_motion_button.clicked.connect(self.stop_motion)
         context.add_bottom_widget(self.stop_motion_button)
@@ -373,6 +409,23 @@ class CooperativeHandlingModule(MurGuiModule):
     def on_robot_selection_changed(self):
         if self.ros_bridge is not None:
             self.ros_bridge.set_robot_names(self.selected_robots())
+        self.on_view_selection_changed()
+
+    def on_view_selection_changed(self, *_unused):
+        if self.top_view_worker is not None:
+            self.top_view_worker.set_selection(
+                self.context.checked_robots(), self.selected_sides()
+            )
+
+    def _map_anchor_toggled(self, enabled):
+        self.temporary_map_anchor_button.setText(
+            f"Temporary map anchor: {'ON' if enabled else 'OFF'}"
+        )
+        self.append_log(
+            "[gui] Temporary map anchor will be "
+            + ("enabled" if enabled else "disabled")
+            + " on next Start Object Nodes"
+        )
 
     def selected_sides(self):
         return self.context.selected_sides()
@@ -390,16 +443,10 @@ class CooperativeHandlingModule(MurGuiModule):
         return self.context.remote_command(robot, command)
 
     def command_for_robot(self, robot, command):
-        if self.context.simulation_mode():
-            return command
         return self.context.remote_command(robot, command)
 
     def ros_command_for_robot(self, robot, command):
-        return self.context.robot_ros_command(
-            robot,
-            command,
-            build_packages="match_cooperative_handling" if self.context.simulation_mode() else "",
-        )
+        return self.context.remote_ros_command(robot, command)
 
     def start_process(self, name, command, env=None, on_finished=None):
         self.context.start_process(name, command, env=env, on_finished=on_finished)
@@ -455,7 +502,7 @@ class CooperativeHandlingModule(MurGuiModule):
             self.command_for_robot(robot, cleanup_cmd)
             for robot in self.selected_robots()
         ]
-        if remote_cleanup and not self.context.simulation_mode():
+        if remote_cleanup:
             cleanup_cmd = " ; ".join(remote_cleanup)
 
         if start_after_cleanup:
@@ -467,19 +514,31 @@ class CooperativeHandlingModule(MurGuiModule):
             )
         else:
             self.append_log("[gui] Stopping virtual object nodes")
-            self.start_process("object_cleanup", cleanup_cmd)
+            self.start_process(
+                "object_cleanup", cleanup_cmd,
+                on_finished=lambda _code, _status: self._reset_view_tf_cache(),
+            )
+
+    def _reset_view_tf_cache(self):
+        if self.top_view_worker is not None:
+            self.top_view_worker.reset_tf_cache()
 
     def _start_object_nodes_after_cleanup(self):
+        self._reset_view_tf_cache()
         object_host = self.object_host()
         self.ros_bridge.set_robot_names(self.selected_robots())
-        map_cmd = (
-            f"exec ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "
-            + f"{WORLD_FRAME} {object_host}/base_link"
-        )
-        self.start_process(
-            self.process_key(object_host, "map_tf"),
-            self.ros_command_for_robot(object_host, map_cmd),
-        )
+        if self.temporary_map_anchor_button.isChecked():
+            map_cmd = (
+                "exec ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "
+                + f"{WORLD_FRAME} {object_host}/base_link"
+            )
+            self.start_process(
+                self.process_key(object_host, "map_tf"),
+                self.ros_command_for_robot(object_host, map_cmd),
+            )
+            self.append_log(f"[gui] Using temporary identity map anchor for {object_host}")
+        else:
+            self.append_log("[gui] Expecting externally provided map -> MuR TF")
         state_cmd = (
             "exec ros2 run match_cooperative_handling virtual_object_state_node --ros-args "
             + f"-p world_frame:={WORLD_FRAME} "
@@ -493,7 +552,8 @@ class CooperativeHandlingModule(MurGuiModule):
             for side in self.selected_sides():
                 prefix = SIDES[side]
                 transform_cmd = (
-                    "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
+                    "exec ros2 run match_cooperative_handling "
+                    "virtual_object_tcp_transform_node --ros-args "
                     + f"-r __ns:=/{robot}/{prefix} "
                     + f"-p robot_name:={robot} "
                     + f"-p arm:={side} "
@@ -506,7 +566,11 @@ class CooperativeHandlingModule(MurGuiModule):
                 )
 
     def set_from_tcp(self):
-        side = "r" if "r" in self.selected_sides() else "l"
+        sides = self.selected_sides()
+        if not sides:
+            self.append_log("[gui] Refusing Set From TCP: no arm selected")
+            return
+        side = "r" if "r" in sides else "l"
         robot = self.object_host()
         cmd = (
             "exec ros2 run match_cooperative_handling set_virtual_object_from_tcp.py --ros-args "
@@ -646,7 +710,7 @@ class CooperativeHandlingModule(MurGuiModule):
             return
         arms = ",".join(sides)
         for robot in self.selected_robots():
-            output_root = WS if self.context.simulation_mode() else self.context.window.remote_ws()
+            output_root = self.context.window.remote_ws()
             output_dir = os.path.join(
                 output_root,
                 "src",
@@ -737,6 +801,9 @@ class CooperativeHandlingModule(MurGuiModule):
         self.stop_object_nodes(start_after_cleanup=False)
 
     def on_shutdown(self):
+        if self.top_view_worker is not None:
+            self.top_view_worker.shutdown()
+            self.top_view_worker.wait(1500)
         self.stop_object_nodes(start_after_cleanup=False)
         if self.ros_bridge is not None:
             self.ros_bridge.shutdown()
