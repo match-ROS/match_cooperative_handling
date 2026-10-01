@@ -499,9 +499,12 @@ class TopViewPanel(QtWidgets.QGroupBox):
             )
             joint.setZValue(2.5)
             if link == "tool0":
-                label = self._scene.addSimpleText(side.upper())
+                label = self._scene.addSimpleText(
+                    side.upper(), QtGui.QFont("Sans Serif", 8, QtGui.QFont.Bold)
+                )
                 label.setBrush(color)
-                label.setPos(point.x() + 7, point.y() - 14)
+                label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations)
+                label.setPos(point.x() + 5, point.y() - 11)
                 label.setZValue(3)
             previous = point
         return points

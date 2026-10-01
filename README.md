@@ -93,9 +93,10 @@ Here `<robot>` is, for example, `mur620a`, and `<side>` is `l` or
 
 ## Top view
 
-The panel above the GUI log projects TF positions into `map`: +X points
-right and +Y up. Its 0.5 m grid, Fit button, mouse-wheel zoom and drag
-make the relative placement visible without a 3D renderer. A simplified
+The panel to the right of the button groups and above the GUI log projects
+TF positions into `map`: +X points right and +Y up. Its 0.5 m grid, Fit
+button, mouse-wheel zoom and drag make the relative placement visible without
+a 3D renderer. Drag the splitters to resize the map and log areas. A simplified
 MiR-600 footprint (about 1.35 × 0.91 m) carries a distinct colored,
 bold **a/b/c/d** and a front marker. Selected UR arms are drawn from
 their TF joint positions; their TCP targets and the virtual object have

@@ -17,7 +17,7 @@ def main():
         modules=[CooperativeHandlingModule()],
         window_title="MuR Cooperative Handling",
     )
-    window.resize(1280, 900)
+    window.resize(1280, 1000)
     window.show()
     sys.exit(app.exec_())
 
