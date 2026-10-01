@@ -15,6 +15,7 @@ from std_msgs.msg import Bool, String
 
 from match_mur_gui.base_gui import MurGuiModule, ROBOTS, SIDES
 
+from .cooperative_mocap_tab import CooperativeMocapTab
 from .top_view import TopViewPanel, TopViewRosWorker
 
 
@@ -339,6 +340,7 @@ class CooperativeHandlingModule(MurGuiModule):
         self.ros_bridge = None
         self.top_view_worker = None
         self.top_view_panel = None
+        self.mocap_tab = None
         self.temporary_map_anchor_button = None
         self._jog_dialog = None
         self._demo_dialog = None
@@ -373,7 +375,16 @@ class CooperativeHandlingModule(MurGuiModule):
             "Set Current Offsets", self.set_current_offsets, section="Cooperative"
         )
 
-        self.top_view_panel = context.add_panel(TopViewPanel(context.window))
+        tabs = QtWidgets.QTabWidget(context.window)
+        self.top_view_panel = TopViewPanel(tabs)
+        self.mocap_tab = CooperativeMocapTab(
+            context, tabs,
+            temporary_anchor_button=self.temporary_map_anchor_button,
+            reset_view_tf_cache=self._reset_view_tf_cache,
+        )
+        tabs.addTab(self.top_view_panel, "Map")
+        tabs.addTab(self.mocap_tab, "Mocap")
+        context.add_panel(tabs)
         self.top_view_worker = TopViewRosWorker(
             context.checked_robots(), context.selected_sides()
         )
@@ -410,6 +421,8 @@ class CooperativeHandlingModule(MurGuiModule):
         if self.ros_bridge is not None:
             self.ros_bridge.set_robot_names(self.selected_robots())
         self.on_view_selection_changed()
+        if self.mocap_tab is not None:
+            self.mocap_tab.update_selection()
 
     def on_view_selection_changed(self, *_unused):
         if self.top_view_worker is not None:
@@ -801,6 +814,8 @@ class CooperativeHandlingModule(MurGuiModule):
         self.stop_object_nodes(start_after_cleanup=False)
 
     def on_shutdown(self):
+        if self.mocap_tab is not None:
+            self.mocap_tab.shutdown()
         if self.top_view_worker is not None:
             self.top_view_worker.shutdown()
             self.top_view_worker.wait(1500)

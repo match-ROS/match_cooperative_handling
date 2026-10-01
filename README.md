@@ -16,11 +16,11 @@ source install/setup.bash
 ros2 run match_cooperative_handling cooperative_handling_gui.py
 ```
 
-If the workspace dependencies are already built, rebuild just the two GUI
-packages:
+If the workspace dependencies are already built, rebuild the edited GUI
+and Mocap packages:
 
 ```bash
-colcon build --packages-select match_mur_gui match_cooperative_handling --symlink-install --allow-overriding match_mur_gui
+colcon build --packages-select match_mur_gui match_mocap_ros2 match_mocap_gui match_cooperative_handling --symlink-install --allow-overriding match_mur_gui
 ```
 
 The installed executable includes the `.py` suffix. Check it with
@@ -40,8 +40,9 @@ GUI does not start an OAK camera.
    Cooperative actions use the first selected MuR in a–d order as the
    **object host**. The base GUI falls back to `mur620d` for actions if no
    MuR is checked; the top view deliberately shows an empty selection then.
-2. Provide `map -> <robot>/base_link` TFs for the selected MuRs. Leave
-   **Temporary map anchor: OFF** when these TFs exist. For a temporary
+2. Provide `map -> <robot>/base_link` TFs for the selected MuRs. The
+   **Mocap** tab can start the Qualisys bridge for this after map calibration
+   is valid. Leave **Temporary map anchor: OFF** when these TFs exist. For a temporary
    single-host setup without a map pose, switch it on before the next
    **Start Object Nodes**; it publishes an identity
    `map -> <object_host>/base_link` transform.
@@ -80,6 +81,8 @@ object control.
 | `/<robot>/UR10_<side>/virtual_object_tcp_transform_node/target_tcp_pose` | `geometry_msgs/PoseStamped`; target in the arm base frame. |
 | `/<robot>/UR10_<side>/virtual_object_tcp_transform_node/relative_object_to_tcp_pose` | `geometry_msgs/PoseStamped`; captured object-to-TCP offset. |
 | `/<robot>/UR10_<side>/virtual_object_tcp_transform_node/start`, `stop` | `std_srvs/Trigger`; arm/disarm virtual-object following. |
+| `/qualisys/<robot>/freeze_localization` | `std_srvs/SetBool`; hold (`true`) or resume (`false`) the selected MuR map pose and robot TF. |
+| `/qualisys/<robot>/localization_frozen` | `std_msgs/Bool`; bridge freeze state. |
 
 Here `<robot>` is, for example, `mur620a`, and `<side>` is `l` or
 `r`. The main frames are:
@@ -93,7 +96,7 @@ Here `<robot>` is, for example, `mur620a`, and `<side>` is `l` or
 
 ## Top view
 
-The panel to the right of the button groups and above the GUI log projects
+The **Map** tab to the right of the button groups and above the GUI log projects
 TF positions into `map`: +X points right and +Y up. Its 0.5 m grid, Fit
 button, mouse-wheel zoom and drag make the relative placement visible without
 a 3D renderer. Drag the splitters to resize the map and log areas. A simplified
@@ -105,11 +108,36 @@ The TF worker refreshes the view at about 5 Hz. Missing or more than
 2 s old dynamic TFs are listed in the panel and are not given invented
 positions.
 
-This view assumes that all selected MuRs already have correct poses in
-one shared `map` frame. The temporary identity anchor does **not**
-compute their relative poses. Do not enable it alongside an existing
-map-to-host transform, because that would publish a competing TF. The
-source of real MuR map poses is a separate follow-up task.
+This view needs correct poses in one shared `map` frame. A calibrated
+Qualisys bridge started from the **Mocap** tab can provide them. The
+temporary identity anchor does **not** compute relative poses. Leave it
+off whenever Mocap or another map-to-host transform is active.
+
+## Mocap tab and localization hold
+
+**Start Mocap** launches the local Qualisys SSH bridge with map poses and
+robot TF enabled for all tracked MuRs. It uses the GUI process's ROS domain,
+the workspace install and the existing `roscore` SSH/QTM setup. **Stop Mocap**
+stops only the bridge started by this GUI. The compact table shows raw
+Qualisys input, map output and the bridge's reported localization state for
+the checked MuRs. If external map poses are already live, the tab shows
+that source and refuses to launch a duplicate bridge.
+
+**Freeze selected MuRs** saves each checked MuR's last fresh, full 6D
+`map` pose. While frozen, the bridge keeps publishing that pose on both
+`/qualisys_map/<robot>/pose` and `pose_smoothed`, and on
+`map -> <robot>/base_footprint` TF with current timestamps. The raw
+`/qualisys/<robot>/pose` remains live for diagnosis. A freeze request is
+rejected if a fresh map pose is unavailable. **Resume selected MuRs** switches
+back to live localization only when a fresh pose is available again; check
+camera visibility first. Results are shown per robot, so a partial success
+is visible. Stopping or losing the bridge also stops the held TF output.
+
+Use the temporary map anchor only when there is no real map TF. Starting
+Mocap switches its button **OFF**; an already running anchor must be stopped
+first, or Mocap start is refused. The bridge requires its checked
+`map -> mocap` calibration; if that check fails, raw Mocap may still arrive
+but map output and freezing will be unavailable.
 
 ## Diagnosis
 
@@ -121,6 +149,8 @@ ros2 run tf2_ros tf2_echo map mur620a/UR10_l/tool0
 ros2 run tf2_ros tf2_echo map virtual_object/base_link
 ros2 topic echo --once /virtual_object/object_pose
 ros2 topic echo --once /mur620a/UR10_l/virtual_object_tcp_transform_node/status
+ros2 topic echo --once /qualisys/mur620a/localization_frozen
+ros2 topic hz /qualisys_map/mur620a/pose
 ros2 service list
 ```
 
