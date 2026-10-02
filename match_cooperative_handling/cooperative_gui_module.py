@@ -375,16 +375,14 @@ class CooperativeHandlingModule(MurGuiModule):
             "Set Current Offsets", self.set_current_offsets, section="Cooperative"
         )
 
-        tabs = QtWidgets.QTabWidget(context.window)
-        self.top_view_panel = TopViewPanel(tabs)
+        self.top_view_panel = TopViewPanel(context.window)
         self.mocap_tab = CooperativeMocapTab(
-            context, tabs,
+            context, context.window,
             temporary_anchor_button=self.temporary_map_anchor_button,
             reset_view_tf_cache=self._reset_view_tf_cache,
         )
-        tabs.addTab(self.top_view_panel, "Map")
-        tabs.addTab(self.mocap_tab, "Mocap")
-        context.add_panel(tabs)
+        context.add_module_tab(self.mocap_tab, "Mocap")
+        context.add_panel(self.top_view_panel)
         self.top_view_worker = TopViewRosWorker(
             context.checked_robots(), context.selected_sides()
         )
@@ -409,7 +407,7 @@ class CooperativeHandlingModule(MurGuiModule):
             "QPushButton { background: #c53030; color: white; font-size: 22px; "
             "font-weight: bold; }"
         )
-        self.stop_motion_button.clicked.connect(self.stop_motion)
+        self.stop_motion_button.clicked.connect(self.stop_and_disable_motion)
         context.add_bottom_widget(self.stop_motion_button)
 
         context.append_log(
@@ -790,9 +788,16 @@ class CooperativeHandlingModule(MurGuiModule):
         if blocked:
             self.append_log("[gui] Refusing start: " + ", ".join(blocked))
             return
-        for robot, side in pairs:
-            service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/start"
-            self.context.ros_worker.call_trigger(service, f"start {robot}/{SIDES[side]}")
+        def start_after_activation():
+            for robot, side in pairs:
+                service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/start"
+                self.context.ros_worker.call_trigger(service, f"start {robot}/{SIDES[side]}")
+
+        self.context.window.enable_cartesian_motion(pairs, on_success=start_after_activation)
+
+    def stop_and_disable_motion(self):
+        self.stop_motion()
+        self.context.window.disable_cartesian_motion(self.context.robot_arm_pairs())
 
     def stop_motion(self):
         self.stop_demo()

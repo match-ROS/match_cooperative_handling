@@ -4,6 +4,19 @@ ROS 2 nodes and a PyQt extension of the shared MuR GUI for moving a virtual
 object with selected UR arms. The GUI also contains a lightweight map-frame
 top view; RViz remains available for full robot inspection.
 
+## Ubuntu application shortcut
+
+After building the GUI package on the GUI computer, install “MuR Cooperative
+Handling” in the application search and on the desktop:
+
+```bash
+python3 /home/rosmatch/colcon_ws/src/match_mur_gui/scripts/install_gui_desktop.py --app cooperative
+```
+
+This user-level installer checks the ROS executable, then creates a launcher
+that sources Jazzy and the Colcon workspace. Use `--workspace PATH` for a
+different workspace. The icon opens the GUI; it does not start robot motion.
+
 ## Build and start
 
 Run from the workspace root on the GUI computer:
@@ -96,7 +109,9 @@ Here `<robot>` is, for example, `mur620a`, and `<side>` is `l` or
 
 ## Top view
 
-The **Map** tab to the right of the button groups and above the GUI log projects
+The **General**, **MiR** and **UR** action tabs are on the left; the
+**Cooperative** and **Mocap** tabs share the middle pane. The permanent **Map**
+panel on the right, above the GUI log, projects
 TF positions into `map`: +X points right and +Y up. Its 0.5 m grid, Fit
 button, mouse-wheel zoom and drag make the relative placement visible without
 a 3D renderer. Drag the splitters to resize the map and log areas. A simplified

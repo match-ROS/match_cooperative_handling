@@ -55,7 +55,8 @@ class FakeContext:
         self.calls = []
         self.logs = []
         self.window = SimpleNamespace(
-            processes={}, freedrive_active={}, remote_ws=lambda: "/remote/workspace"
+            processes={}, freedrive_active={}, remote_ws=lambda: "/remote/workspace",
+            enable_cartesian_motion=lambda pairs, on_success: on_success(),
         )
         self.ros_worker = SimpleNamespace(
             call_trigger=lambda service, label: self.calls.append((service, label))
@@ -165,3 +166,17 @@ def test_set_from_tcp_requires_selected_arm():
     module.set_from_tcp()
     assert not context.started
     assert any("no arm selected" in line for line in context.logs)
+
+
+def test_start_waits_for_controller_activation():
+    context = FakeContext()
+    pending = []
+    context.window.enable_cartesian_motion = lambda pairs, on_success: pending.append(on_success)
+    module = CooperativeHandlingModule()
+    module.context = context
+    module.ros_bridge = FakeBridge()
+    module.start_motion()
+    assert len(pending) == 1
+    assert not context.calls
+    pending[0]()
+    assert len([service for service, _ in context.calls if service.endswith("/start")]) == 4
