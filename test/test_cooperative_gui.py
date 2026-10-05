@@ -65,6 +65,9 @@ class FakeContext:
     def selected_robots(self):
         return ["mur620a", "mur620b"]
 
+    def checked_robots(self):
+        return self.selected_robots()
+
     def selected_sides(self):
         return list(self.sides)
 
@@ -131,14 +134,25 @@ def test_remote_workflow_and_optional_map_anchor(temporary_anchor):
     }.issubset(names)
     assert all(command.startswith("ssh_ros:") for _, command, _ in starts)
 
-    module.set_from_tcp()
+    module.set_object_at_tcp(("mur620b", "l"))
     module.set_object_center()
+    module._set_object_from_tcps(
+        [("mur620a", "r"), ("mur620b", "l")],
+        xyz=(0.1, -0.2, 0.3), rpy_deg=(10.0, 20.0, -30.0), frame="world"
+    )
     module.set_current_offsets()
     module.start_tracking_log()
-    assert any("set_virtual_object_from_tcp.py" in command and "-p arm:=r" in command
-               for _, command, _ in context.started)
-    assert any("set_virtual_object_from_manipulators.py" in command
-               for _, command, _ in context.started)
+    object_commands = [
+        command for _, command, _ in context.started
+        if "set_virtual_object_from_tcps.py" in command
+    ]
+    assert len(object_commands) == 3
+    assert "-p tcp_pairs:=mur620b:l" in object_commands[0]
+    assert "-p tcp_pairs:=mur620a:l,mur620a:r,mur620b:l,mur620b:r" in object_commands[1]
+    assert "-p tcp_pairs:=mur620a:r,mur620b:l" in object_commands[2]
+    assert "-p offset_frame:=world" in object_commands[2]
+    assert "-p offset_y:=-0.200000" in object_commands[2]
+    assert "-p offset_yaw_deg:=-30.000000" in object_commands[2]
     assert sum("set_relative_pose_from_current_object.py" in command
                for _, command, _ in context.started) == 2
     assert sum("/remote/workspace/src/match_cooperative_handling/logs/tracking" in command
@@ -158,14 +172,14 @@ def test_remote_workflow_and_optional_map_anchor(temporary_anchor):
     assert module.top_view_worker.resets == 2
 
 
-def test_set_from_tcp_requires_selected_arm():
+def test_set_object_center_requires_selected_arm():
     context = FakeContext(sides=())
     module = CooperativeHandlingModule()
     module.context = context
     module.ros_bridge = FakeBridge()
-    module.set_from_tcp()
+    module.set_object_center()
     assert not context.started
-    assert any("no arm selected" in line for line in context.logs)
+    assert any("Select at least one TCP" in line for line in context.logs)
 
 
 def test_start_waits_for_controller_activation():

@@ -56,6 +56,7 @@ install(PROGRAMS
   scripts/move_arm_to_named_pose.py
   scripts/set_relative_pose_from_current_object.py
   scripts/set_virtual_object_from_manipulators.py
+  scripts/set_virtual_object_from_tcps.py
   scripts/set_virtual_object_from_tcp.py
   scripts/virtual_object_demo_runner.py
   DESTINATION lib/${PROJECT_NAME}
@@ -66,6 +67,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_cooperative_gui test/test_cooperative_gui.py)
   ament_add_pytest_test(test_top_view test/test_top_view.py)
   ament_add_pytest_test(test_mocap_tab test/test_mocap_tab.py)
+  ament_add_pytest_test(test_object_pose_math test/test_object_pose_math.py)
+  ament_add_pytest_test(test_virtual_object_ui test/test_virtual_object_ui.py)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)

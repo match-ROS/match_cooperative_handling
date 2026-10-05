@@ -63,10 +63,15 @@ GUI does not start an OAK camera.
    This cleans up previous cooperative object processes on the selected
    hosts, starts one virtual-object state node on the object host, and
    starts one TCP transform node for each selected MuR/arm pair.
-4. Initialize the virtual object with **Set From TCP** (right arm on the
-   object host if selected, otherwise left) or **Set Object Center** (both
-   arms on the object host). Then use **Set Current Offsets** to capture the
-   object-to-TCP relationship for every selected MuR/arm.
+4. In **Set Virtual Object**, click a TCP button (for example,
+   **mur620a links**) to place the object exactly at that TCP. The checkboxes
+   beside the buttons select TCPs for **Center** and **Offset from Center**.
+   Center averages the selected TCP positions and orientations across all
+   checked MuRs. Offset from Center opens a dialog for XYZ in meters and RPY
+   in degrees; choose whether the offset uses the center object's axes or
+   the fixed `map` axes. The selected TCPs receive their object-to-TCP
+   offsets immediately. Use **Set Current Offsets** afterward if other
+   selected MuR/arm pairs should follow the new object pose as well.
 5. Wait for each selected arm's status to become `ready`. **START MOTION**
    checks UR readiness and calls each TCP node's start service. Its
    preflight checks current object data, the relative pose, the required
@@ -81,6 +86,14 @@ GUI does not start an OAK camera.
 
 The shared GUI's Home L/R controls use MoveIt separately from cooperative
 object control.
+
+The **Set Virtual Object** field only offers MuR/arm pairs checked in the
+shared controls. With one TCP, Center is that TCP's pose. A local XYZ offset
+rotates with the center orientation; a world XYZ offset is applied directly
+in `map`. Local RPY is composed after the center orientation, while world
+RPY is composed before it. Both rotate the object about its own center.
+All required TCP transforms must be available in the same `map` tree before
+the object pose is published.
 
 ## ROS interfaces
 

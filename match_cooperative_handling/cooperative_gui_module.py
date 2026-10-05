@@ -334,6 +334,136 @@ class DemoDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+class ObjectOffsetDialog(QtWidgets.QDialog):
+    """Enter a pose offset relative to the selected TCP center."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Offset from Center")
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.frame = QtWidgets.QComboBox()
+        self.frame.addItem("Object coordinates (center TCP axes)", "object")
+        self.frame.addItem("World coordinates (map axes)", "world")
+        form.addRow("Offset in", self.frame)
+        self.xyz = []
+        for axis in "XYZ":
+            field = QtWidgets.QDoubleSpinBox()
+            field.setRange(-10.0, 10.0)
+            field.setDecimals(3)
+            field.setSingleStep(0.01)
+            field.setSuffix(" m")
+            form.addRow(f"{axis}", field)
+            self.xyz.append(field)
+        self.rpy = []
+        for axis in ("Roll", "Pitch", "Yaw"):
+            field = QtWidgets.QDoubleSpinBox()
+            field.setRange(-180.0, 180.0)
+            field.setDecimals(1)
+            field.setSingleStep(1.0)
+            field.setSuffix(" °")
+            form.addRow(axis, field)
+            self.rpy.append(field)
+        layout.addLayout(form)
+        hint = QtWidgets.QLabel(
+            "Object axes rotate with the TCP center. Map axes stay fixed; "
+            "RPY rotates the object about its center."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Set Virtual Object")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return (
+            tuple(field.value() for field in self.xyz),
+            tuple(field.value() for field in self.rpy),
+            self.frame.currentData(),
+        )
+
+
+class VirtualObjectPanel(QtWidgets.QGroupBox):
+    """Direct TCP placement and an independent selection for center modes."""
+
+    def __init__(self, module, parent=None):
+        super().__init__("Set Virtual Object", parent)
+        self.module = module
+        self.pair_checks = {}
+        self.pair_rows = {}
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(3, 8, 3, 6)
+        hint = QtWidgets.QLabel(
+            "Click a TCP to place the object there. Tick TCPs for Center / Offset."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.grid = QtWidgets.QGridLayout()
+        self.grid.setHorizontalSpacing(4)
+        self.grid.setVerticalSpacing(4)
+        for index, robot in enumerate(ROBOTS):
+            for side_index, (side, name) in enumerate((("l", "links"), ("r", "rechts"))):
+                pair = (robot, side)
+                row = QtWidgets.QWidget()
+                row_layout = QtWidgets.QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(3)
+                check = QtWidgets.QCheckBox()
+                check.setChecked(True)
+                check.setToolTip("Include this TCP in Center and Offset from Center")
+                button = QtWidgets.QPushButton(f"{robot} {name}")
+                button.setMinimumHeight(32)
+                button.setToolTip("Set the virtual object exactly on this TCP")
+                button.clicked.connect(partial(module.set_object_at_tcp, pair))
+                row_layout.addWidget(check)
+                row_layout.addWidget(button, 1)
+                self.grid.addWidget(row, index, side_index)
+                self.pair_checks[pair] = check
+                self.pair_rows[pair] = row
+        layout.addLayout(self.grid)
+        self.empty_hint = QtWidgets.QLabel("Select a MuR and an arm above.")
+        layout.addWidget(self.empty_hint)
+        actions = QtWidgets.QHBoxLayout()
+        self.center_button = QtWidgets.QPushButton("Center")
+        self.center_button.setMinimumHeight(36)
+        self.center_button.clicked.connect(module.set_object_center)
+        actions.addWidget(self.center_button)
+        self.offset_button = QtWidgets.QPushButton("Offset from Center…")
+        self.offset_button.setMinimumHeight(36)
+        self.offset_button.clicked.connect(module.open_object_offset)
+        actions.addWidget(self.offset_button)
+        layout.addLayout(actions)
+        for check in self.pair_checks.values():
+            check.toggled.connect(self._update_buttons)
+        self.update_selection()
+
+    def update_selection(self):
+        available = {
+            (robot, side)
+            for robot in self.module.context.checked_robots()
+            for side in self.module.selected_sides()
+        }
+        for pair, row in self.pair_rows.items():
+            row.setVisible(pair in available)
+        self.empty_hint.setVisible(not available)
+        self._update_buttons()
+
+    def selected_pairs(self):
+        return [
+            pair for pair, check in self.pair_checks.items()
+            if not self.pair_rows[pair].isHidden() and check.isChecked()
+        ]
+
+    def _update_buttons(self, *_unused):
+        enabled = bool(self.selected_pairs())
+        self.center_button.setEnabled(enabled)
+        self.offset_button.setEnabled(enabled)
+
+
 class CooperativeHandlingModule(MurGuiModule):
     def __init__(self):
         self.context = None
@@ -342,6 +472,7 @@ class CooperativeHandlingModule(MurGuiModule):
         self.top_view_panel = None
         self.mocap_tab = None
         self.temporary_map_anchor_button = None
+        self.object_panel = None
         self._jog_dialog = None
         self._demo_dialog = None
 
@@ -363,14 +494,15 @@ class CooperativeHandlingModule(MurGuiModule):
             "On the next Start Object Nodes, publish map -> object host/base_link as identity. "
             "Use only while no real map pose is available."
         )
-        context.add_action_button("Set From TCP", self.set_from_tcp, section="Cooperative")
+        self.object_panel = context.add_section_widget(
+            VirtualObjectPanel(self, context.window), section="Cooperative"
+        )
         context.add_action_button("Open Object Jog", self.open_object_jog, section="Cooperative")
         context.add_tool_button("Demos", self.open_demos, section="Cooperative")
         context.add_tool_button(
             "Start Tracking Log", self.start_tracking_log, section="Cooperative"
         )
         context.add_tool_button("Stop Tracking Log", self.stop_tracking_log, section="Cooperative")
-        context.add_tool_button("Set Object Center", self.set_object_center, section="Cooperative")
         context.add_tool_button(
             "Set Current Offsets", self.set_current_offsets, section="Cooperative"
         )
@@ -423,6 +555,8 @@ class CooperativeHandlingModule(MurGuiModule):
             self.mocap_tab.update_selection()
 
     def on_view_selection_changed(self, *_unused):
+        if self.object_panel is not None:
+            self.object_panel.update_selection()
         if self.top_view_worker is not None:
             self.top_view_worker.set_selection(
                 self.context.checked_robots(), self.selected_sides()
@@ -576,44 +710,63 @@ class CooperativeHandlingModule(MurGuiModule):
                     self.ros_command_for_robot(robot, transform_cmd),
                 )
 
-    def set_from_tcp(self):
-        sides = self.selected_sides()
-        if not sides:
-            self.append_log("[gui] Refusing Set From TCP: no arm selected")
-            return
-        side = "r" if "r" in sides else "l"
-        robot = self.object_host()
-        cmd = (
-            "exec ros2 run match_cooperative_handling set_virtual_object_from_tcp.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p arm:={side} "
-            + f"-p world_frame:={WORLD_FRAME}"
-        )
-        self.start_process(
-            self.process_key(robot, f"set_from_tcp_{side}"),
-            self.ros_command_for_robot(robot, cmd),
-        )
+    def selected_object_tcps(self):
+        if self.object_panel is not None:
+            return self.object_panel.selected_pairs()
+        return self.context.robot_arm_pairs()
 
-    def set_object_center(self):
-        sides = self.selected_sides()
-        if len(sides) < 2:
-            self.append_log("[gui] Refusing object center: select at least two manipulators")
+    def set_object_at_tcp(self, pair, *_unused):
+        robot, side = pair
+        if robot not in self.context.checked_robots() or side not in self.selected_sides():
+            self.append_log("[gui] Select this MuR and arm before setting the object")
             return
-        robot = self.object_host()
-        arms = ",".join(sides)
+        self._set_object_from_tcps([pair])
+
+    def set_object_center(self, *_unused):
+        self._set_object_from_tcps(self.selected_object_tcps())
+
+    def open_object_offset(self, *_unused):
+        pairs = self.selected_object_tcps()
+        if not pairs:
+            self.append_log("[gui] Select at least one TCP for Offset from Center")
+            return
+        dialog = ObjectOffsetDialog(self.context.window)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            xyz, rpy_deg, frame = dialog.values()
+            self._set_object_from_tcps(pairs, xyz, rpy_deg, frame)
+
+    def _set_object_from_tcps(
+        self, pairs, xyz=(0.0, 0.0, 0.0), rpy_deg=(0.0, 0.0, 0.0), frame="object"
+    ):
+        if not pairs:
+            self.append_log("[gui] Select at least one TCP to set the virtual object")
+            return
+        host = self.object_host()
+        tcp_pairs = ",".join(f"{robot}:{side}" for robot, side in pairs)
+        parameters = [
+            f"-p tcp_pairs:={tcp_pairs}",
+            f"-p world_frame:={WORLD_FRAME}",
+            f"-p offset_frame:={frame}",
+        ]
+        parameters.extend(
+            f"-p offset_{axis}:={value:.6f}"
+            for axis, value in zip("xyz", xyz)
+        )
+        parameters.extend(
+            f"-p offset_{axis}_deg:={value:.6f}"
+            for axis, value in zip(("roll", "pitch", "yaw"), rpy_deg)
+        )
         cmd = (
-            "exec ros2 run match_cooperative_handling "
-            + "set_virtual_object_from_manipulators.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p arms:={arms} "
-            + f"-p world_frame:={WORLD_FRAME}"
+            "exec ros2 run match_cooperative_handling set_virtual_object_from_tcps.py "
+            "--ros-args " + " ".join(parameters)
         )
         self.append_log(
-            f"[gui] Setting virtual object center on {robot} from selected manipulators: {arms}"
+            f"[gui] Setting virtual object from {tcp_pairs}; "
+            f"{frame} offset xyz={xyz} m, rpy={rpy_deg} deg"
         )
         self.start_process(
-            self.process_key(robot, "set_object_center"),
-            self.ros_command_for_robot(robot, cmd),
+            self.process_key(host, "set_virtual_object"),
+            self.ros_command_for_robot(host, cmd),
         )
 
     def set_current_offsets(self):
