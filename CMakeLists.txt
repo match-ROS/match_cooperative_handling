@@ -18,28 +18,28 @@ find_package(tf2_ros REQUIRED)
 ament_python_install_package(match_cooperative_handling)
 
 add_executable(virtual_object_state_node src/virtual_object_state_node.cpp)
-ament_target_dependencies(virtual_object_state_node
-  geometry_msgs
-  rclcpp
-  tf2
-  tf2_ros
+target_link_libraries(virtual_object_state_node
+  ${geometry_msgs_TARGETS}
+  ${rclcpp_TARGETS}
+  ${tf2_TARGETS}
+  ${tf2_ros_TARGETS}
 )
 
 add_executable(virtual_object_demo_runner src/virtual_object_demo_runner.cpp)
-ament_target_dependencies(virtual_object_demo_runner
-  geometry_msgs
-  rclcpp
+target_link_libraries(virtual_object_demo_runner
+  ${geometry_msgs_TARGETS}
+  ${rclcpp_TARGETS}
 )
 
 add_executable(virtual_object_tcp_transform_node src/virtual_object_tcp_transform_node.cpp)
-ament_target_dependencies(virtual_object_tcp_transform_node
-  geometry_msgs
-  rclcpp
-  std_msgs
-  std_srvs
-  tf2
-  tf2_geometry_msgs
-  tf2_ros
+target_link_libraries(virtual_object_tcp_transform_node
+  ${geometry_msgs_TARGETS}
+  ${rclcpp_TARGETS}
+  ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${tf2_TARGETS}
+  ${tf2_geometry_msgs_TARGETS}
+  ${tf2_ros_TARGETS}
 )
 
 install(TARGETS
